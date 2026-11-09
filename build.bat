@@ -20,11 +20,10 @@ pyinstaller --noconfirm --clean --onefile --noconsole ^
     --name %APP% --icon icon.ico ^
     --add-data "index.html;." ^
     --collect-submodules uvicorn ^
-    --collect-submodules langchain ^
     --collect-submodules langchain_core ^
     --collect-submodules langchain_openai ^
     --collect-submodules openai ^
-    --collect-submodules langgraph ^
+    --collect-data faker ^
     --collect-submodules pymupdf ^
     --hidden-import uvicorn.logging ^
     --hidden-import uvicorn.loops.auto ^

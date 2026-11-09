@@ -7,6 +7,8 @@ main.py — веб-сервис обезличивания PDF/Excel с лока
 import hashlib
 import json
 import logging
+import os
+import random
 import re
 import socket
 import sys
@@ -15,8 +17,11 @@ import time
 import urllib.request
 import uuid
 import webbrowser
+from datetime import date as date_cls, datetime as datetime_cls, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+from faker import Faker
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -105,22 +110,29 @@ def get_current_user(request: Request) -> str:
     return login
 
 
-# ---------------------------------------------------------------- PII-правила
+# ---------------------------------------------------------------- PII-правила и фейки
 MASK = "***"
 
-# (имя, regex). Всё совпадение заменяется на ***.
+CYR_UPPER = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+CYR_LOWER = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+LAT_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+LAT_LOWER = "abcdefghijklmnopqrstuvwxyz"
+ALL_LETTERS = CYR_LOWER + CYR_UPPER + LAT_LOWER + LAT_UPPER
+ORG_PREFIXES = {"ООО", "ОАО", "ЗАО", "ПАО", "АО", "ИП", "ФГУП", "ГУП", "МУП",
+                "ГБУ", "ГАУ", "АНО", "НКО", "ФОНД", "МИНИСТЕРСТВО", "ДЕПАРТАМЕНТ",
+                "УПРАВЛЕНИЕ", "КОМПАНИЯ"}
+ORG_NAMES = ["Вектор", "Гранит", "Сфера", "Прогресс", "Альфа", "Лазурит", "Меркурий",
+             "Орион", "Темп", "Стандарт", "Ресурс", "Гарант", "Партнёр", "Рубин",
+             "Кристалл", "Импульс", "Атлант", "Кедр", "Волна", "Заря"]
+ORG_SUFFIXES = ["Групп", "Сервис", "Трейд", "Плюс", "Технологии", "Ресурс", "Снаб"]
+
+# (тип, regex). Совпадение целиком заменяется похожим ненастоящим значением.
 PLAIN_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("email", re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])")),
     ("phone", re.compile(r"(?<!\d)(?:\+7|8)[\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}(?!\d)")),
-    ("snils", re.compile(r"(?<!\d)\d{3}[-\s]\d{3}[-\s]\d{3}[-\s]\d{2}(?!\d)")),
-    ("snils_plain", re.compile(r"(?<!\d)\d{11}(?!\d)")),
-    ("passport", re.compile(r"(?<!\d)\d{2}\s+\d{2}\s+№?\s*\d{6}(?!\d)")),
-    ("passport", re.compile(r"(?<!\d)\d{4}\s+№\s*\d{6}(?!\d)")),
-    ("account", re.compile(r"(?<!\d)\d{20}(?!\d)")),
-    ("ogrn", re.compile(r"(?<!\d)(?:\d{13}|\d{15})(?!\d)")),
-    ("inn", re.compile(r"(?<!\d)(?:\d{10}|\d{12})(?!\d)")),
-    ("kpp", re.compile(r"(?<!\d)\d{4}[0-9A-ZА-Я]{2}\d{3}(?!\d)")),
-    ("bik", re.compile(r"(?<!\d)\d{9}(?!\d)")),
+    ("passport", re.compile(r"(?<!\d)\d{2}\s?\d{2}(?:\s*(?:№|номер)\s*|\s+)\d{6}(?!\d)", re.I)),
+    ("snils", re.compile(r"(?<!\d)\d{3}[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{2}(?!\d)")),
+    ("kpp", re.compile(r"(?<!\d)\d{4}[A-ZА-Я]{2}\d{3}(?!\d)", re.I)),
     ("fio", re.compile(r"(?<![А-Яа-яЁё])(?:[А-ЯЁ][а-яё]{1,20}\s+){2}[А-ЯЁ][а-яё]{1,20}(?![А-Яа-яЁё])")),
     ("fio_initials", re.compile(r"(?<![А-Яа-яЁё])[А-ЯЁ][а-яё]{1,20}\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.(?![А-Яа-яЁё])")),
     ("org", re.compile(
@@ -130,21 +142,25 @@ PLAIN_PATTERNS: List[Tuple[str, re.Pattern]] = [
         r"(?<![А-Яа-яЁё])(?:г\.|город|ул\.|улица|пр-т|проспект|пер\.|переулок|наб\.|набережная|"
         r"ш\.|шоссе|д\.|дом|кв\.|квартира|обл\.|область|респ\.|республика|п\.|пос\.|поселок|"
         r"с\.|село|мкр\.|микрорайон)\s*[^\n,;]{1,80}(?:,\s*[^\n;]{1,80}){0,4}", re.I)),
+    ("date", re.compile(r"(?<!\d)(?:\d{2}[./-]\d{2}[./-]\d{4}|\d{4}[./-]\d{2}[./-]\d{2})(?!\d)")),
+    ("number", re.compile(r"(?<![\d.,])-?(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d+)(?:[.,]\d+)?(?![\d])")),
 ]
 
-# (regex, номер группы): заменяется только группа, префикс-метка сохраняется.
-GROUP_PATTERNS: List[Tuple[re.Pattern, int]] = [
-    (re.compile(r"((?:паспорт|серия|серии)\s*[:\-]?\s*)"
-                r"(\d{2}\s?\d{2}\s*(?:№|номер)?\s*\d{6})", re.I), 2),
-    (re.compile(r"((?:СНИЛС|страховой номер)\s*[:\-]?\s*)"
-                r"(\d{3}[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{2})", re.I), 2),
-    (re.compile(r"((?:ФИО|Ф\.И\.О\.|Сотрудник|Работник|Владелец|Директор|Главный бухгалтер)\s*[:\-]?\s*)"
-                r"([А-ЯЁ][^\n;]{2,120})", re.I), 2),
-    (re.compile(r"((?:Организация|Наименование|Работодатель|Компания)\s*[:\-]?\s*)"
-                r"([^\n;]{2,150})", re.I), 2),
-    (re.compile(r"((?:Адрес|Место жительства|Место нахождения|Почтовый адрес)\s*[:\-]?\s*)"
-                r"([^\n;]{5,200})", re.I), 2),
+# (тип, regex, номер группы). Меняется только значение, метка сохраняется.
+GROUP_PATTERNS: List[Tuple[str, re.Pattern, int]] = [
+    ("kpp", re.compile(r"(?:КПП)\s*[:\-]?\s*(\d{4}[0-9A-ZА-Я]{2}\d{3})", re.I), 1),
+    ("fio", re.compile(
+        r"(?:ФИО|Ф\.И\.О\.|Сотрудник|Работник|Владелец|Директор|Главный бухгалтер)"
+        r"\s*[:\-]?\s*([А-ЯЁ][А-ЯЁа-яё. \t-]{2,80})", re.I), 1),
+    ("org", re.compile(
+        r"(?:Организация|Наименование|Работодатель|Компания)\s*[:\-]?\s*([^\n;,]{2,150})", re.I), 1),
+    ("address", re.compile(
+        r"(?:Адрес|Место жительства|Место нахождения|Почтовый адрес)\s*[:\-]?\s*([^\n;]{5,200})", re.I), 1),
 ]
+
+PRIORITY = {"email": 10, "phone": 10, "passport": 9, "snils": 9, "kpp": 9,
+            "date": 8, "fio": 7, "fio_initials": 7, "org": 7, "address": 7,
+            "number": 1, "extra": 5}
 
 
 def _clean_value(v: str) -> str:
@@ -152,43 +168,242 @@ def _clean_value(v: str) -> str:
     return v.strip(" \t\r\n,;.\"'«»")
 
 
-def _sub_group(m: re.Match, group: int) -> str:
-    start, end = m.span(group)
-    whole = m.group(0)
-    return whole[: start - m.start()] + MASK + whole[end - m.start():]
-
-
-def mask_text(text: Any, extras: Any = ()) -> Any:
-    if not isinstance(text, str) or not text:
+def _mix_letters(text: str, rate: float = 0.08) -> str:
+    """Подмешивает случайные буквы того же алфавита и регистра."""
+    if not text or len(text) <= 2:
         return text
-    for v in sorted({_clean_value(x) for x in extras if len(_clean_value(x)) >= 3}, key=len, reverse=True):
-        if v and v != MASK:
-            text = re.sub(re.escape(v), MASK, text, flags=re.I)
-    for rx, group in GROUP_PATTERNS:
-        text = rx.sub(lambda m: _sub_group(m, group), text)
-    for _, rx in PLAIN_PATTERNS:
-        text = rx.sub(MASK, text)
-    return text
+    cyr = bool(re.search(r"[А-Яа-яЁё]", text))
+    pool = (CYR_UPPER if text.isupper() else CYR_LOWER) if cyr else (LAT_UPPER if text.isupper() else LAT_LOWER)
+    out = []
+    for ch in text:
+        out.append(ch)
+        if ch.isalpha() and random.random() < rate:
+            out.append(random.choice(pool))
+    return "".join(out)
 
 
-def find_pii(text: str, extras: Any = ()) -> List[str]:
-    text = (text or "").replace("\u00ad", "-").replace("\xa0", " ")
-    values = set()
+def _rand_digits(n: int, leading_zero: bool = False) -> str:
+    if n <= 0:
+        return ""
+    first = "0" if leading_zero else random.choice("123456789")
+    return first + "".join(random.choice("0123456789") for _ in range(n - 1))
+
+
+def _infer_kind(v: str) -> str:
+    s = v.strip()
+    if "@" in s:
+        return "email"
+    if re.search(r"(?:\+7|8)[\s\-()]*\d{3}[\s\-()]*\d{3}", s):
+        return "phone"
+    if re.search(r"\d{2}\s?\d{2}(?:\s*(?:№|номер)\s*|\s+)\d{6}", s, re.I):
+        return "passport"
+    if re.search(r"\d{3}[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{2}", s):
+        return "snils"
+    if re.fullmatch(r"\d{4}[A-ZА-Я]{2}\d{3}", s, re.I):
+        return "kpp"
+    if re.search(r"(?:ООО|ОАО|ЗАО|ПАО|АО|ИП|ФГУП|ГУП|МУП|ГБУ|ГАУ|АНО|НКО|Фонд|"
+                 r"Министерство|Департамент|Управление|Компания)", s, re.I):
+        return "org"
+    if re.search(r"(?:г\.|ул\.|д\.|кв\.|обл\.|пр-т|проспект|наб\.|ш\.|мкр\.|пос\.|с\.|респ\.)", s, re.I):
+        return "address"
+    words = s.split()
+    if 2 <= len(words) <= 4 and all(w[:1].isupper() for w in words if w):
+        return "fio"
+    if re.fullmatch(r"[\d\s.,-]+", s):
+        return "number"
+    return "extra"
+
+
+class Masker:
+    """Генерирует и запоминает фейковые значения в рамках одного документа."""
+
+    def __init__(self):
+        self.fake = Faker("ru_RU")
+        self.cache: Dict[Tuple[str, str], str] = {}
+
+    def get(self, kind: str, original: str) -> str:
+        key = (kind, original)
+        if key not in self.cache:
+            self.cache[key] = self._gen(kind, original)
+        return self.cache[key]
+
+    def _gen(self, kind: str, original: str) -> str:
+        if kind == "extra":
+            kind = _infer_kind(original)
+        if kind == "fio":
+            for _ in range(5):
+                name = re.sub(r"^(?:г-н|г-жа|господин|госпожа)\s+", "", self.fake.name(), flags=re.I)
+                v = _mix_letters(name, 0.08)
+                if v != original:
+                    return v
+            return _mix_letters(name, 0.08)
+        if kind == "fio_initials":
+            return (f"{_mix_letters(self.fake.last_name(), 0.1)} "
+                    f"{self.fake.first_name()[0]}.{self.fake.middle_name()[0]}.")
+        if kind == "phone":
+            compact = not any(c in original for c in " ()-")
+            prefix = "8" if original.strip().startswith("8") else "+7"
+            d = _rand_digits(10)
+            return prefix + d if compact else f"{prefix} ({d[:3]}) {d[3:6]}-{d[6:8]}-{d[8:10]}"
+        if kind == "email":
+            return self.fake.email()
+        if kind == "org":
+            m = re.match(r"^([А-ЯA-Z]+)\s+", original)
+            prefix = m.group(1) if m and m.group(1).upper() in ORG_PREFIXES else ""
+            if prefix.upper() == "ИП":
+                return "ИП " + _mix_letters(self.fake.name(), 0.05)
+            name = f"{random.choice(ORG_NAMES)} {random.choice(ORG_SUFFIXES)}"
+            return f"{prefix} «{name}»" if prefix else f"«{name}»"
+        if kind == "address":
+            return (f"г. {self.fake.city_name()}, {self.fake.street_name()}, "
+                    f"д. {self.fake.building_number()}")
+        if kind == "passport":
+            m = re.match(r"^(\d{2})(\s*)(\d{2})(.*?)(\d{6})$", original, re.S)
+            if m:
+                series = _rand_digits(4)
+                return series[:2] + m.group(2) + series[2:] + m.group(4) + _rand_digits(6)
+            return _rand_digits(4) + " " + _rand_digits(6)
+        if kind == "snils":
+            digits9 = "".join(random.choice("0123456789") for _ in range(9))
+            total = sum(int(d) * (9 - i) for i, d in enumerate(digits9))
+            if total < 100:
+                check = total
+            elif total in (100, 101):
+                check = 0
+            else:
+                check = total % 101
+                if check == 100:
+                    check = 0
+            num = digits9 + f"{check:02d}"
+            if "-" in original:
+                return f"{num[:3]}-{num[3:6]}-{num[6:9]} {num[9:]}"
+            if " " in original:
+                return f"{num[:3]} {num[3:6]} {num[6:9]} {num[9:]}"
+            return num
+        if kind == "kpp":
+            letters = "АБВГДЕЖЗИКЛМНОПРСТУФХЦЧШЩЭЮЯ"
+            return _rand_digits(4, True) + "".join(random.choice(letters) for _ in range(2)) + _rand_digits(3)
+        if kind == "date":
+            m = re.match(r"^(\d{2})([./-])(\d{2})\2(\d{4})$", original)
+            if m:
+                d = date_cls(1995, 1, 1) + timedelta(days=random.randint(0, 12000))
+                return d.strftime(f"%d{m.group(2)}%m{m.group(2)}%Y")
+            m = re.match(r"^(\d{4})([./-])(\d{2})\2(\d{2})$", original)
+            if m:
+                d = date_cls(1995, 1, 1) + timedelta(days=random.randint(0, 12000))
+                return d.strftime(f"%Y{m.group(2)}%m{m.group(2)}%d")
+            return self._number(original)
+        if kind == "number":
+            return self._number(original)
+        return _mix_letters(" ".join(self.fake.word().capitalize()
+                                     for _ in range(max(1, len(original.split())))), 0.05)
+
+    @staticmethod
+    def _number_once(original: str) -> str:
+        s = original.strip()
+        sign = ""
+        if s[:1] in ("-", "−"):
+            sign, s = "-", s[1:]
+        dec = None
+        if "," in s and "." in s:
+            dec = "," if s.rfind(",") > s.rfind(".") else "."
+        elif "," in s:
+            dec = ","
+        elif "." in s and s.count(".") == 1 and 1 <= len(s.rsplit(".", 1)[1]) <= 2:
+            dec = "."
+        thou = None
+        if " " in s:
+            thou = " "
+        elif "\u00a0" in s:
+            thou = "\u00a0"
+        elif dec == "," and "." in s:
+            thou = "."
+        elif dec == "." and "," in s:
+            thou = ","
+        elif dec is None and "." in s:
+            thou = "."
+        clean = s.replace(thou, "") if thou else s
+        if dec and dec in clean:
+            int_part, frac_part = clean.split(dec, 1)
+        else:
+            int_part, frac_part = clean, ""
+        int_digits = re.sub(r"\D", "", int_part) or "0"
+        frac_digits = re.sub(r"\D", "", frac_part)
+        new_int = _rand_digits(len(int_digits), leading_zero=int_digits.startswith("0"))
+        new_frac = "".join(random.choice("0123456789") for _ in range(len(frac_digits)))
+        if thou:
+            chunks, x = [], new_int
+            while x:
+                chunks.insert(0, x[-3:])
+                x = x[:-3]
+            new_int = thou.join(chunks)
+        return sign + new_int + ((dec + new_frac) if dec and frac_digits else "")
+
+    @staticmethod
+    def _number(original: str) -> str:
+        for _ in range(10):
+            result = Masker._number_once(original)
+            if result != original:
+                return result
+        return Masker._number_once(original)
+
+
+def _add_candidate(cands: List[Tuple[int, int, str, str]], start: int, end: int,
+                   kind: str, raw: str) -> None:
+    left = len(raw) - len(raw.lstrip())
+    right = len(raw) - len(raw.rstrip())
+    start += left
+    end -= right
+    if end - start >= 2:
+        cands.append((start, end, kind, raw.strip()))
+
+
+def iter_matches(text: str, extras: Any = ()) -> List[Tuple[int, int, str, str]]:
+    """Возвращает непересекающиеся совпадения (start, end, тип, значение)."""
+    if not isinstance(text, str) or not text:
+        return []
+    # 1:1-нормализация, чтобы позиции совпадали с исходной строкой
+    mt = text.replace("\u00ad", "-").replace("\xa0", " ").replace("\u2011", "-")
+    cands: List[Tuple[int, int, str, str]] = []
+    for kind, rx, group in GROUP_PATTERNS:
+        for m in rx.finditer(mt):
+            _add_candidate(cands, m.start(group), m.end(group), kind, m.group(group))
+    for kind, rx in PLAIN_PATTERNS:
+        for m in rx.finditer(mt):
+            _add_candidate(cands, m.start(), m.end(), kind, m.group(0))
     for x in extras:
         v = _clean_value(x)
         if len(v) >= 3 and v != MASK:
-            values.add(v)
-    for rx, group in GROUP_PATTERNS:
-        for m in rx.finditer(text):
-            v = _clean_value(m.group(group))
-            if len(v) >= 3:
-                values.add(v)
-    for _, rx in PLAIN_PATTERNS:
-        for m in rx.finditer(text):
-            v = m.group(0).strip()
-            if v:
-                values.add(v)
-    return sorted(values, key=len, reverse=True)
+            kind = _infer_kind(v)
+            for m in re.finditer(re.escape(v), mt, re.I):
+                _add_candidate(cands, m.start(), m.end(), kind, m.group(0))
+    best: Dict[Tuple[int, int], Tuple[int, int, str, str]] = {}
+    for c in cands:
+        key = (c[0], c[1])
+        prev = best.get(key)
+        if prev is None or PRIORITY.get(c[2], 0) > PRIORITY.get(prev[2], 0):
+            best[key] = c
+    selected: List[Tuple[int, int, str, str]] = []
+    for c in sorted(best.values(), key=lambda x: (-(x[1] - x[0]), -PRIORITY.get(x[2], 0), x[0])):
+        if all(c[1] <= s or c[0] >= e for s, e, _, _ in selected):
+            selected.append(c)
+    return sorted(selected, key=lambda x: x[0])
+
+
+def mask_text(text: Any, extras: Any = (), masker: Masker | None = None) -> Any:
+    if not isinstance(text, str) or not text:
+        return text
+    matches = iter_matches(text, extras)
+    if not matches:
+        return text
+    masker = masker or Masker()
+    out, last = [], 0
+    for start, end, kind, value in matches:
+        out.append(text[last:start])
+        out.append(masker.get(kind, value))
+        last = end
+    out.append(text[last:])
+    return "".join(out)
 
 
 # ---------------------------------------------------------------- RAG на LangChain
@@ -209,8 +424,9 @@ KNOWLEDGE: List[str] = [
     "а также после меток «Организация», «Наименование», «Работодатель».",
     "Адреса — строки после «Адрес», «Место жительства», «Место нахождения», а также конструкции "
     "с «г.», «ул.», «д.», «кв.», «обл.», «пр-т», «ш.», «мкр.». Маскировать адрес целиком.",
-    "Все найденные значения заменяются ровно на три звёздочки ***. Структура документа сохраняется: "
-    "таблицы, страницы, шрифты и расположение текста не меняются.",
+    "Все найденные значения заменяются похожими ненастоящими значениями: ФИО — фейковое ФИО, "
+    "телефон — фейковый телефон, адрес — фейковый адрес, числа — другие числа той же длины и формата. "
+    "Структура документа сохраняется: таблицы, страницы и расположение текста не меняются.",
 ]
 
 
@@ -361,74 +577,6 @@ def detect_extra_pii(text: str) -> Tuple[List[str], bool]:
     return sorted(found), ok
 
 
-try:
-    from langchain_core.tools import tool
-except Exception:  # pragma: no cover
-    def tool(fn):
-        return fn
-
-
-@tool
-def search_rules(query: str) -> str:
-    """Найти в RAG-базе знаний правила и шаблоны поиска персональных данных."""
-    return rag_search(query) or "Правила не найдены."
-
-
-@tool
-def detect_pii(text: str) -> str:
-    """Найти ФИО, названия организаций и адреса в тексте локальной LLM. Возвращает JSON-массив строк."""
-    values, _ = detect_extra_pii(text)
-    return json.dumps(values, ensure_ascii=False)
-
-
-@tool
-def mask_text_tool(text: str, extra_values: str = "[]") -> str:
-    """Замаскировать ПДн в тексте на ***. extra_values — JSON-массив дополнительных значений."""
-    try:
-        extras = json.loads(extra_values) if extra_values else []
-    except Exception:
-        extras = []
-    return mask_text(text, extras)
-
-
-@tool
-def extract_pdf_text_tool(path: str) -> str:
-    """Извлечь весь текст из PDF-файла по указанному пути."""
-    return extract_pdf_text(Path(path))
-
-
-@tool
-def extract_excel_text_tool(path: str) -> str:
-    """Извлечь текст из Excel-файла (.xlsx) по указанному пути."""
-    return extract_excel_text(Path(path))
-
-
-@tool
-def mask_pdf_tool(path: str, out_path: str, extra_values: str = "[]") -> str:
-    """Обезличить PDF: заменить ПДн на ***, сохранив страницы и расположение текста."""
-    try:
-        extras = json.loads(extra_values) if extra_values else []
-    except Exception:
-        extras = []
-    r = mask_pdf_file(Path(path), Path(out_path), extras)
-    return json.dumps(r, ensure_ascii=False)
-
-
-@tool
-def mask_excel_tool(path: str, out_path: str, extra_values: str = "[]") -> str:
-    """Обезличить Excel (.xlsx): заменить ПДн в ячейках на ***, сохранив структуру книги."""
-    try:
-        extras = json.loads(extra_values) if extra_values else []
-    except Exception:
-        extras = []
-    r = mask_excel_file(Path(path), Path(out_path), extras)
-    return json.dumps(r, ensure_ascii=False)
-
-
-TOOLS = [search_rules, detect_pii, mask_text_tool, extract_pdf_text_tool,
-         extract_excel_text_tool, mask_pdf_tool, mask_excel_tool]
-
-
 # ---------------------------------------------------------------- обработка файлов
 def extract_pdf_text(path: Path) -> str:
     import pymupdf
@@ -441,17 +589,36 @@ def extract_pdf_text(path: Path) -> str:
         doc.close()
 
 
-def _pdf_search_forms(value: str) -> List[str]:
-    base = value.replace("\u00ad", "").replace("\xa0", " ").replace("\u2011", "-")
-    forms = [
-        value, base, " ".join(base.split()), base.replace(" ", ""), base.replace("-", " "),
-        base.replace("-", "\u00ad"), base.replace(" ", "\xa0"),
-        base.replace("-", "\u00ad").replace(" ", "\xa0"),
-    ]
-    return [f for f in dict.fromkeys(forms) if len(f) >= 3]
+def _cyr_font() -> str | None:
+    fonts = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    for name in ("arial.ttf", "segoeui.ttf", "calibri.ttf", "times.ttf", "tahoma.ttf"):
+        p = fonts / name
+        if p.exists():
+            return str(p)
+    return None
+
+
+def _text_width(font, text: str, size: float) -> float:
+    try:
+        return float(font.text_length(text, fontsize=size))
+    except Exception:
+        return len(text) * size * 0.55
+
+
+def _span_color(span: Dict[str, Any]) -> Tuple[float, float, float]:
+    c = span.get("color", 0)
+    if not isinstance(c, int):
+        return (0.0, 0.0, 0.0)
+    return (((c >> 16) & 255) / 255.0, ((c >> 8) & 255) / 255.0, (c & 255) / 255.0)
 
 
 def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict[str, Any]:
+    """Заменить ПДн в PDF, перерисовывая затронутые текстовые фрагменты целиком.
+
+    Красные аннотации ставятся на весь span, а не на отдельное значение: иначе
+    PyMuPDF после удаления части строки перерисовывает остаток span и сдвигает
+    соседние метки (например, «ОГРН»).
+    """
     import pymupdf
     doc = pymupdf.open(input_path)
     if doc.needs_pass:
@@ -459,28 +626,66 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict
         raise ValueError("PDF защищён паролем")
     total = 0
     pages = len(doc)
+    fontfile = _cyr_font()
+    font = pymupdf.Font(fontfile=fontfile) if fontfile else None
+    masker = Masker()
     for page in doc:
-        page_text = page.get_text("text")
-        seen: set[Tuple[float, float, float, float]] = set()
-        for value in find_pii(page_text, extras):
-            rects = []
-            for form in _pdf_search_forms(value):
-                try:
-                    rects = page.search_for(form)
-                except Exception:
-                    rects = []
-                if rects:
-                    break
-            for rect in rects:
-                key = (round(rect.x0, 1), round(rect.y0, 1), round(rect.x1, 1), round(rect.y1, 1))
-                if key in seen:
+        page_dict = page.get_text("dict")
+        all_spans: List[Dict[str, Any]] = []
+        for block in page_dict.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if span.get("text", "").strip():
+                        all_spans.append(span)
+        jobs: List[Tuple[Any, Tuple[float, float], float, str, Tuple[float, float, float]]] = []
+        for span in all_spans:
+            text = span.get("text", "")
+            if not text:
+                continue
+            fake = mask_text(text, extras, masker)
+            if fake == text:
+                continue
+            bbox = pymupdf.Rect(span["bbox"])
+            origin = span.get("origin") or (bbox.x0, bbox.y1)
+            size = float(span.get("size") or 10.0)
+            # Ближайший соседний span на той же визуальной строке ограничивает
+            # ширину: в таблицах каждая ячейка может быть отдельной строкой/блоком.
+            next_x = page.rect.x1 - 18
+            for other in all_spans:
+                if other is span:
                     continue
-                seen.add(key)
-                fs = max(5, min(11, rect.height * 0.8))
-                page.add_redact_annot(rect, text=MASK, fontsize=fs,
-                                      fill=(1, 1, 1), text_color=(0, 0, 0))
-                total += 1
-        page.apply_redactions(images=getattr(pymupdf, "PDF_REDACT_IMAGE_NONE", 0))
+                ob = pymupdf.Rect(other["bbox"])
+                if ob.x0 <= bbox.x0 + 1:
+                    continue
+                overlap = min(bbox.y1, ob.y1) - max(bbox.y0, ob.y0)
+                if overlap > 0.4 * min(bbox.height, ob.height):
+                    next_x = min(next_x, ob.x0)
+            avail = max(12.0, next_x - bbox.x0 - 2)
+            if font is not None:
+                fs = size
+                width = _text_width(font, fake, fs)
+                if width > avail > 0:
+                    fs = max(4.0, fs * avail / width)
+                draw_text = fake
+            else:
+                fs = max(4.0, min(11.0, size))
+                draw_text = MASK
+            jobs.append((bbox, (float(origin[0]), float(origin[1])), fs,
+                         draw_text, _span_color(span)))
+        if not jobs:
+            continue
+        for bbox, _, _, _, _ in jobs:
+            page.add_redact_annot(bbox, fill=None)
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                              graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                              text=pymupdf.PDF_REDACT_TEXT_REMOVE)
+        for _, origin, fs, draw_text, color in jobs:
+            if fontfile:
+                page.insert_text(origin, draw_text, fontname="F0", fontfile=fontfile,
+                                 fontsize=fs, color=color)
+            else:
+                page.insert_text(origin, draw_text, fontname="helv", fontsize=fs, color=color)
+            total += 1
     doc.save(output_path, garbage=3, deflate=True)
     doc.close()
     return {"masked": total, "pages": pages}
@@ -510,16 +715,31 @@ def extract_excel_text(path: Path, limit: int = 20000) -> str:
 def mask_excel_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict[str, Any]:
     import openpyxl
     wb = openpyxl.load_workbook(input_path)
+    masker = Masker()
     masked = 0
     for ws in wb.worksheets:
         for row in ws.iter_rows():
             for cell in row:
                 v = cell.value
-                if isinstance(v, str) and v and not v.startswith("="):
-                    nv = mask_text(v, extras)
-                    if nv != v:
-                        cell.value = nv
+                if v is None or isinstance(v, bool):
+                    continue
+                if isinstance(v, str):
+                    if v and not v.startswith("="):
+                        nv = mask_text(v, extras, masker)
+                        if nv != v:
+                            cell.value = nv
+                            masked += 1
+                elif isinstance(v, (datetime_cls, date_cls)):
+                    cell.value = v + timedelta(days=random.randint(-3650, 3650))
+                    masked += 1
+                elif isinstance(v, (int, float)):
+                    fake = masker.get("number", str(v))
+                    try:
+                        cell.value = (int(fake) if isinstance(v, int)
+                                      else float(fake.replace(" ", "").replace("\u00a0", "").replace(",", ".")))
                         masked += 1
+                    except Exception:
+                        pass
     wb.save(output_path)
     # предпросмотр первого листа
     preview: List[List[str]] = []
@@ -560,50 +780,6 @@ def process_excel(input_path: Path, output_path: Path) -> Dict[str, Any]:
             "llm_used": llm_ok, "extras": extras[:50], **stats}
 
 
-# ---------------------------------------------------------------- LangChain-агент
-_AGENT: Dict[str, Any] = {"key": None, "agent": None}
-
-
-def get_agent():
-    s = load_settings()
-    key = (s["lm_studio_url"], s["model"])
-    if _AGENT["key"] != key:
-        agent = None
-        llm = get_llm(s)
-        if llm is not None:
-            try:
-                from langchain.agents import create_agent
-                agent = create_agent(llm, TOOLS, system_prompt=(
-                    "Ты — помощник по обезличиванию документов. Используй инструменты для поиска правил, "
-                    "извлечения текста и маскировки PDF/Excel. Все ПДн заменяются на ***. Отвечай кратко."))
-            except Exception as e:
-                logger.warning(f"agent init: {e}")
-        _AGENT.update(key=key, agent=agent)
-    return _AGENT["agent"]
-
-
-def run_agent(question: str) -> str:
-    agent = get_agent()
-    if agent is not None:
-        try:
-            res = agent.invoke({"messages": [{"role": "user", "content": question}]})
-            msgs = res.get("messages") if isinstance(res, dict) else None
-            if msgs:
-                content = msgs[-1].content
-                if isinstance(content, list):
-                    return "".join(x.get("text", "") for x in content if isinstance(x, dict))
-                return str(content)
-        except Exception as e:
-            logger.warning(f"agent run: {e}")
-    llm = get_llm()
-    if llm is not None:
-        try:
-            return str(llm.invoke(question).content)
-        except Exception as e:
-            logger.warning(f"llm fallback: {e}")
-    return "LM Studio недоступен. Проверьте settings.json и запущенную модель."
-
-
 # ---------------------------------------------------------------- FastAPI
 app = FastAPI(title="PII Masker + RAG")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -612,10 +788,6 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 class LoginRequest(BaseModel):
     login: str
     password: str
-
-
-class ChatRequest(BaseModel):
-    message: str
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -646,17 +818,7 @@ def health():
     if RETRIEVER is None:
         build_rag()
     return {"ok": True, "model": s["model"], "lm_studio_url": s["lm_studio_url"],
-            "llm_ok": check_llm(s), "rag": RETRIEVER is not None, "tools": len(TOOLS)}
-
-
-@app.get("/api/tools")
-def tools(user: str = Depends(get_current_user)):
-    return {"tools": [{"name": t.name, "description": (t.description or "").strip()} for t in TOOLS]}
-
-
-@app.post("/api/chat")
-def chat(req: ChatRequest, user: str = Depends(get_current_user)):
-    return {"answer": run_agent(req.message)}
+            "llm_ok": check_llm(s), "rag": RETRIEVER is not None}
 
 
 @app.post("/api/process")

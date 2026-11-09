@@ -31,7 +31,6 @@
 
 <div id="app" hidden>
   <div class="box">
-    <div class="muted">Модель: <b id="model">—</b> · LM Studio: <span id="llm">—</span> · RAG: <span id="rag">—</span></div>
     <p>
       <input type="file" id="file" accept=".pdf,.xlsx">
       <button id="btn">Обработать</button>
@@ -47,12 +46,6 @@
     <div id="preview"></div>
   </div>
 
-  <div class="box">
-    <div class="muted">AI-помощник (инструменты LangChain: поиск правил, извлечение, маскировка)</div>
-    <p><input id="chatIn" placeholder="Например: какие ПДн искать в PDF?" style="width:70%">
-       <button id="chatBtn">Спросить</button></p>
-    <pre id="chatOut" hidden></pre>
-  </div>
 </div>
 
 <script>
@@ -65,16 +58,6 @@ function headers() {
 function msg(text, isErr) {
   $("status").textContent = text;
   $("status").className = isErr ? "err" : "muted";
-}
-async function health() {
-  try {
-    const r = await fetch("/api/health");
-    const d = await r.json();
-    $("model").textContent = d.model;
-    $("llm").textContent = d.llm_ok ? "подключён" : "недоступен";
-    $("llm").className = d.llm_ok ? "ok" : "err";
-    $("rag").textContent = d.rag ? "готов" : "нет";
-  } catch (e) {}
 }
 async function login() {
   const body = {login: $("login").value.trim(), password: $("password").value};
@@ -92,7 +75,6 @@ async function login() {
 function showApp() {
   $("loginBox").hidden = true;
   $("app").hidden = false;
-  health();
 }
 $("loginBtn").onclick = login;
 $("password").onkeydown = e => { if (e.key === "Enter") login(); };
@@ -103,7 +85,7 @@ $("btn").onclick = async () => {
   if (!f) return msg("Выберите файл", true);
   const fd = new FormData();
   fd.append("file", f);
-  msg("Обработка... (локальная LLM может думать несколько минут)");
+  msg("Обработка...");
   $("result").hidden = true;
   try {
     const r = await fetch("/api/process", {method: "POST", headers: headers(), body: fd});
@@ -133,8 +115,7 @@ function showResult(d) {
       tmp.click(); URL.revokeObjectURL(url);
     } catch (err) { msg("Ошибка скачивания: " + err.message, true); }
   };
-  $("stats").textContent = "Заменено: " + d.masked + " · LLM использована: " + (d.llm_used ? "да" : "нет") +
-    " · Доп. значений от LLM: " + (d.extras ? d.extras.length : 0);
+  $("stats").textContent = "Заменено: " + d.masked;
   const p = $("preview");
   p.textContent = "";
   if (d.preview_type === "excel" && Array.isArray(d.preview)) {
@@ -155,24 +136,6 @@ function showResult(d) {
     p.appendChild(pre);
   }
 }
-
-$("chatBtn").onclick = async () => {
-  const text = $("chatIn").value.trim();
-  if (!text) return;
-  $("chatOut").hidden = false;
-  $("chatOut").textContent = "Думаю...";
-  try {
-    const r = await fetch("/api/chat", {
-      method: "POST", headers: {...headers(), "Content-Type": "application/json"},
-      body: JSON.stringify({message: text})
-    });
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.detail || "Ошибка");
-    $("chatOut").textContent = d.answer;
-  } catch (e) {
-    $("chatOut").textContent = "Ошибка: " + e.message;
-  }
-};
 
 if (creds) showApp();
 </script>
