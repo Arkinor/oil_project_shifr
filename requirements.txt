@@ -7,3 +7,5 @@ faker==33.1.0
 langchain-core==1.7.6
 langchain-openai==1.7.4
 pyinstaller==6.11.1
+pystray>=0.19
+pillow>=10.0

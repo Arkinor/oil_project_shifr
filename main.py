@@ -3,8 +3,14 @@ main.py — веб-сервис обезличивания PDF/Excel с лока
 
 Запуск:  python main.py
 Сборка:  build.bat  ->  dist/PIIMasker.exe
+
+Для сборки с треем добавьте в PyInstaller:
+    --hidden-import=pystray --hidden-import=PIL --hidden-import=PIL.Image
+и положите иконку рядом с main.py (icon.ico). Если pystray/Pillow не
+установлены — сервис работает как обычно, без трея.
 """
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -44,6 +50,7 @@ for d in (DATA_DIR, UPLOAD_DIR, OUTPUT_DIR, KNOWLEDGE_DIR):
 SETTINGS_FILE = APP_DIR / "settings.json"
 USERS_FILE = DATA_DIR / "users.json"
 LOG_FILE = DATA_DIR / "activity.log"
+SERVER_LOG_FILE = DATA_DIR / "server.log"
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "lm_studio_url": "http://127.0.0.1:1234/v1",
@@ -53,9 +60,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "max_tokens": 1024,
     "request_timeout": 90,
     "max_llm_chars": 12000,
+    "max_upload_mb": 50,
     "host": "0.0.0.0",
     "port": 9321,
     "open_browser": True,
+    "tray_enabled": True,
+    "tray_minimize_on_close": True,
 }
 
 logging.basicConfig(
@@ -99,7 +109,13 @@ def load_users() -> List[Dict[str, str]]:
 
 
 def authenticate(login: str, password: str) -> bool:
-    return any(u.get("login") == login and u.get("password") == password for u in load_users())
+    login = login or ""
+    password = password or ""
+    for u in load_users():
+        if hmac.compare_digest(str(u.get("login", "")), login) and \
+           hmac.compare_digest(str(u.get("password", "")), password):
+            return True
+    return False
 
 
 def get_current_user(request: Request) -> str:
@@ -173,7 +189,10 @@ def _mix_letters(text: str, rate: float = 0.08) -> str:
     if not text or len(text) <= 2:
         return text
     cyr = bool(re.search(r"[А-Яа-яЁё]", text))
-    pool = (CYR_UPPER if text.isupper() else CYR_LOWER) if cyr else (LAT_UPPER if text.isupper() else LAT_LOWER)
+    if cyr:
+        pool = CYR_UPPER if text.isupper() else CYR_LOWER
+    else:
+        pool = LAT_UPPER if text.isupper() else LAT_LOWER
     out = []
     for ch in text:
         out.append(ch)
@@ -231,12 +250,13 @@ class Masker:
         if kind == "extra":
             kind = _infer_kind(original)
         if kind == "fio":
+            name = ""
             for _ in range(5):
                 name = re.sub(r"^(?:г-н|г-жа|господин|госпожа)\s+", "", self.fake.name(), flags=re.I)
                 v = _mix_letters(name, 0.08)
                 if v != original:
                     return v
-            return _mix_letters(name, 0.08)
+            return _mix_letters(name, 0.08) if name else "Иванов Иван Иванович"
         if kind == "fio_initials":
             return (f"{_mix_letters(self.fake.last_name(), 0.1)} "
                     f"{self.fake.first_name()[0]}.{self.fake.middle_name()[0]}.")
@@ -717,41 +737,43 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = ()) -> Di
     wb = openpyxl.load_workbook(input_path)
     masker = Masker()
     masked = 0
-    for ws in wb.worksheets:
-        for row in ws.iter_rows():
-            for cell in row:
-                v = cell.value
-                if v is None or isinstance(v, bool):
-                    continue
-                if isinstance(v, str):
-                    if v and not v.startswith("="):
-                        nv = mask_text(v, extras, masker)
-                        if nv != v:
-                            cell.value = nv
-                            masked += 1
-                elif isinstance(v, (datetime_cls, date_cls)):
-                    cell.value = v + timedelta(days=random.randint(-3650, 3650))
-                    masked += 1
-                elif isinstance(v, (int, float)):
-                    fake = masker.get("number", str(v))
-                    try:
-                        cell.value = (int(fake) if isinstance(v, int)
-                                      else float(fake.replace(" ", "").replace("\u00a0", "").replace(",", ".")))
-                        masked += 1
-                    except Exception:
-                        pass
-    wb.save(output_path)
-    # предпросмотр первого листа
-    preview: List[List[str]] = []
     try:
-        ws = wb.active
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-            if i >= 8:
-                break
-            preview.append([("" if c is None else str(c))[:60] for c in row[:8]])
-    except Exception:
-        pass
-    wb.close()
+        for ws in wb.worksheets:
+            for row in ws.iter_rows():
+                for cell in row:
+                    v = cell.value
+                    if v is None or isinstance(v, bool):
+                        continue
+                    if isinstance(v, str):
+                        if v and not v.startswith("="):
+                            nv = mask_text(v, extras, masker)
+                            if nv != v:
+                                cell.value = nv
+                                masked += 1
+                    elif isinstance(v, (datetime_cls, date_cls)):
+                        cell.value = v + timedelta(days=random.randint(-3650, 3650))
+                        masked += 1
+                    elif isinstance(v, (int, float)):
+                        fake = masker.get("number", str(v))
+                        try:
+                            cell.value = (int(fake) if isinstance(v, int)
+                                          else float(fake.replace(" ", "").replace("\u00a0", "").replace(",", ".")))
+                            masked += 1
+                        except Exception:
+                            pass
+        wb.save(output_path)
+        # предпросмотр первого листа
+        preview: List[List[str]] = []
+        try:
+            ws = wb.active
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= 8:
+                    break
+                preview.append([("" if c is None else str(c))[:60] for c in row[:8]])
+        except Exception:
+            pass
+    finally:
+        wb.close()
     return {"masked": masked, "pages": 1, "preview_rows": preview}
 
 
@@ -763,9 +785,11 @@ def process_pdf(input_path: Path, output_path: Path) -> Dict[str, Any]:
     try:
         import pymupdf
         doc = pymupdf.open(output_path)
-        if len(doc):
-            preview = doc[0].get_text("text")[:1800]
-        doc.close()
+        try:
+            if len(doc):
+                preview = doc[0].get_text("text")[:1800]
+        finally:
+            doc.close()
     except Exception:
         pass
     return {"preview_type": "pdf", "preview": preview, "llm_used": llm_ok,
@@ -817,19 +841,37 @@ def health():
     s = load_settings()
     if RETRIEVER is None:
         build_rag()
-    return {"ok": True, "model": s["model"], "lm_studio_url": s["lm_studio_url"],
-            "llm_ok": check_llm(s), "rag": RETRIEVER is not None}
+    return {
+        "ok": True,
+        "model": s["model"],
+        "lm_studio_url": s["lm_studio_url"],
+        "llm_ok": check_llm(s),
+        "rag": RETRIEVER is not None,
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "tray": TRAY_ICON is not None,
+        "users_count": len(load_users()),
+    }
+
+
+def _safe_name(name: str) -> str:
+    name = Path(name or "document").name
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)[:200] or "document"
 
 
 @app.post("/api/process")
 def process(file: UploadFile = File(...), user: str = Depends(get_current_user)):
-    original = Path(file.filename or "document").name
+    s = load_settings()
+    original = _safe_name(file.filename or "document")
     ext = Path(original).suffix.lower()
     if ext not in (".pdf", ".xlsx"):
         raise HTTPException(400, "Поддерживаются только PDF и Excel (.xlsx)")
-    content = file.file.read()
+
+    max_mb = int(s.get("max_upload_mb", 50))
+    content = file.file.read(max_mb * 1024 * 1024 + 1)
     if not content:
         raise HTTPException(400, "Пустой файл")
+    if len(content) > max_mb * 1024 * 1024:
+        raise HTTPException(413, f"Файл больше {max_mb} МБ")
 
     uid = uuid.uuid4().hex[:12]
     in_path = UPLOAD_DIR / f"{user}_{uid}_{original}"
@@ -856,8 +898,11 @@ def process(file: UploadFile = File(...), user: str = Depends(get_current_user))
 @app.get("/api/download/{filename}")
 def download(filename: str, user: str = Depends(get_current_user)):
     name = Path(filename).name
-    path = OUTPUT_DIR / name
-    if not path.exists():
+    path = (OUTPUT_DIR / name).resolve()
+    # защита от path traversal
+    if not str(path).startswith(str(OUTPUT_DIR.resolve()) + os.sep):
+        raise HTTPException(400, "Недопустимое имя файла")
+    if not path.exists() or not path.is_file():
         raise HTTPException(404, "Файл не найден")
     media = ("application/pdf" if name.lower().endswith(".pdf")
              else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -865,8 +910,88 @@ def download(filename: str, user: str = Depends(get_current_user)):
     return FileResponse(path, media_type=media, filename=name)
 
 
+# ---------------------------------------------------------------- трей
+TRAY_ICON = None  # заполняется, если pystray доступен
+
+
+def _tray_image():
+    """Пробует загрузить иконку, иначе рисует простой кружок."""
+    from PIL import Image, ImageDraw
+    base = Path(getattr(sys, "_MEIPASS", APP_DIR))
+    for candidate in ("icon.ico", "icon.png", "app.ico"):
+        p = base / candidate
+        if p.exists():
+            try:
+                return Image.open(p)
+            except Exception:
+                pass
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((4, 4, 60, 60), fill=(47, 111, 235, 255))
+    d.ellipse((20, 20, 44, 44), fill=(255, 255, 255, 255))
+    return img
+
+
+def _open_browser(port: int) -> None:
+    webbrowser.open(f"http://127.0.0.1:{port}")
+
+
+def _open_output_dir() -> None:
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(str(OUTPUT_DIR))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            os.system(f'open "{OUTPUT_DIR}"')
+        else:
+            os.system(f'xdg-open "{OUTPUT_DIR}"')
+    except Exception as e:
+        logger.warning(f"open_output_dir: {e}")
+
+
+def start_tray(port: int) -> None:
+    """Запускает иконку в трее (в главном потоке). При выходе — os._exit(0)."""
+    global TRAY_ICON
+    if not getattr(sys, "frozen", False):
+        # в режиме разработки трей не нужен
+        return
+    try:
+        import pystray
+        from pystray import MenuItem as Item, Menu
+    except Exception as e:
+        logger.warning(f"pystray недоступен: {e}")
+        return
+
+    def on_open(icon, item):
+        _open_browser(port)
+
+    def on_outputs(icon, item):
+        _open_output_dir()
+
+    def on_quit(icon, item):
+        try:
+            icon.stop()
+        finally:
+            os._exit(0)
+
+    menu = Menu(
+        Item("Открыть сайт", on_open, default=True),
+        Item("Папка результатов", on_outputs),
+        Menu.SEPARATOR,
+        Item("Выход", on_quit),
+    )
+
+    try:
+        icon = pystray.Icon("pii_masker", _tray_image(), "PII Masker", menu)
+        TRAY_ICON = icon
+        icon.run()
+    except Exception as e:
+        logger.error(f"tray run: {e}")
+        TRAY_ICON = None
+
+
 # ---------------------------------------------------------------- запуск
 class _NoConsoleStream:
+    """Заглушка вместо sys.stdout/stderr при сборке без консоли."""
     def write(self, *args, **kwargs):
         return 0
 
@@ -875,6 +1000,20 @@ class _NoConsoleStream:
 
     def isatty(self) -> bool:
         return False
+
+    def fileno(self):
+        raise OSError("no console")
+
+
+def _setup_file_logging() -> None:
+    """Дублирует логи uvicorn в data/server.log при frozen-сборке."""
+    try:
+        fh = logging.FileHandler(SERVER_LOG_FILE, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+        logging.getLogger().addHandler(fh)
+        logging.getLogger().setLevel(logging.INFO)
+    except Exception:
+        pass
 
 
 def _lan_ip() -> str:
@@ -888,22 +1027,48 @@ def _lan_ip() -> str:
         return "127.0.0.1"
 
 
-def run_server():
+def _run_uvicorn(host: str, port: int) -> None:
+    import uvicorn
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+def run_server() -> None:
     ensure_settings()
     ensure_users_file()
     build_rag()
-    if sys.stdout is None:
-        sys.stdout = _NoConsoleStream()
-    if sys.stderr is None:
-        sys.stderr = _NoConsoleStream()
+
+    frozen = bool(getattr(sys, "frozen", False))
+    if frozen:
+        if sys.stdout is None:
+            sys.stdout = _NoConsoleStream()
+        if sys.stderr is None:
+            sys.stderr = _NoConsoleStream()
+        _setup_file_logging()
+
     s = load_settings()
     port = int(s.get("port", 9321))
     host = str(s.get("host", "0.0.0.0"))
-    print(f"Сайт: http://127.0.0.1:{port}  |  в сети: http://{_lan_ip()}:{port}")
+
+    if not frozen:
+        print(f"Сайт: http://127.0.0.1:{port}  |  в сети: http://{_lan_ip()}:{port}")
+
     if s.get("open_browser", True):
-        threading.Timer(1.5, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
-    import uvicorn
-    uvicorn.run(app, host=host, port=port, log_level="info")
+        threading.Timer(1.5, lambda: _open_browser(port)).start()
+
+    use_tray = frozen and bool(s.get("tray_enabled", True))
+
+    if use_tray:
+        # uvicorn — в фоновом потоке, трей — в главном (требование pystray на Windows/macOS)
+        server_thread = threading.Thread(
+            target=_run_uvicorn, args=(host, port), daemon=True, name="uvicorn"
+        )
+        server_thread.start()
+        start_tray(port)
+        # если трей не запустился — дождёмся сервера в главном потоке
+        if TRAY_ICON is None:
+            server_thread.join()
+    else:
+        _run_uvicorn(host, port)
 
 
 if __name__ == "__main__":

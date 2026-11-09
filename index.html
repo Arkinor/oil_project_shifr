@@ -3,141 +3,424 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Обезличивание документов</title>
+<title>Обезличивание документов — Эксойл Групп</title>
 <style>
-  body{font:15px system-ui,Segoe UI,Arial;max-width:900px;margin:28px auto;padding:0 16px;color:#222}
-  h2{margin:0 0 14px}
-  input,button{padding:8px 10px;font-size:14px}
-  button{cursor:pointer}
-  .box{border:1px solid #ddd;border-radius:8px;padding:14px;margin:12px 0}
-  .muted{color:#666;font-size:13px}
-  table{border-collapse:collapse;width:100%;font-size:12px;margin-top:8px}
-  td,th{border:1px solid #ddd;padding:4px 6px;text-align:left;vertical-align:top}
-  pre{white-space:pre-wrap;background:#f6f6f6;padding:10px;border-radius:6px;max-height:420px;overflow:auto;font-size:12px}
-  .err{color:#b00020}
-  .ok{color:#087f23}
-  a{color:#0645ad}
+  :root{
+    --bg:#f6f5f3; --card:#ffffff; --text:#1c1f23; --muted:#6b7485;
+    --border:#e6e1da;
+    --brand:#b45309;         /* тёмно-оранжевый */
+    --brand-h:#92400e;
+    --brand-soft:rgba(180,83,9,.10);
+    --green:#1f9d55; --green-h:#178347;
+    --err:#c0233b;
+    --shadow:0 1px 3px rgba(0,0,0,.06),0 8px 24px rgba(0,0,0,.06);
+    --radius:14px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{--bg:#15130f; --card:#1e1b17; --text:#ece7e1; --muted:#a49a8d;
+          --border:#33302a;
+          --brand:#e08a3c; --brand-h:#f0a55a; --brand-soft:rgba(224,138,60,.14);
+          --green:#2bbd6a; --green-h:#25a75c; --err:#ff6b81;
+          --shadow:0 1px 3px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:15px/1.45 system-ui,Segoe UI,Roboto,Arial,sans-serif;
+       min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:36px 16px}
+  main{max-width:760px;width:100%}
+
+  .brand{text-align:center;margin:0 0 6px;font-size:26px;font-weight:800;
+         letter-spacing:.02em;color:var(--brand)}
+  h1{font-size:17px;margin:0 0 24px;font-weight:500;color:var(--muted);text-align:center}
+
+  .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+        padding:22px;margin:0 0 16px;box-shadow:var(--shadow)}
+  .step{margin-bottom:10px;font-size:15px;font-weight:650}
+  .step .num{display:inline-flex;width:24px;height:24px;border-radius:50%;
+             align-items:center;justify-content:center;margin-right:8px;
+             background:var(--brand);color:#fff;font-size:13px;font-weight:700}
+
+  .drop{border:2px dashed var(--border);border-radius:12px;padding:26px 18px;text-align:center;
+        cursor:pointer;transition:border-color .15s,background .15s}
+  .drop:hover,.drop.over{border-color:var(--brand);background:var(--brand-soft)}
+  .drop .title{font-weight:600;margin-bottom:4px}
+  .drop .hint{color:var(--muted);font-size:13px}
+  .drop.has-file{border-color:var(--green);border-style:solid;
+                 background:color-mix(in srgb,var(--green) 7%,transparent)}
+  .drop .fname{margin-top:10px;font-size:13.5px;font-weight:600;color:var(--green);
+               word-break:break-all}
+
+  button{font:inherit;font-weight:600;border-radius:10px;cursor:pointer;border:1px solid transparent;
+         padding:11px 18px;transition:background .15s,transform .05s}
+  button:active{transform:translateY(1px)}
+  button:disabled{opacity:.55;cursor:not-allowed}
+  .btn-primary{background:var(--brand);color:#fff}
+  .btn-primary:hover:not(:disabled){background:var(--brand-h)}
+  .btn-download{display:flex;align-items:center;justify-content:center;gap:10px;
+                width:100%;padding:16px 20px;font-size:16px;font-weight:700;
+                background:var(--green);color:#fff;border-radius:12px;text-decoration:none}
+  .btn-download:hover{background:var(--green-h)}
+  .btn-download svg{flex:none}
+
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px}
+  .row .grow{flex:1 1 200px}
+  .link-btn{background:transparent;color:var(--muted);border:none;font-weight:500;font-size:13px;
+            padding:6px 0;cursor:pointer}
+  .link-btn:hover{color:var(--brand);text-decoration:underline}
+
+  .progress-wrap{margin-top:16px}
+  .progress{height:8px;border-radius:999px;background:color-mix(in srgb,var(--muted) 18%,transparent);
+            overflow:hidden;position:relative}
+  .progress .bar{height:100%;width:0%;border-radius:999px;background:var(--brand);
+                 transition:width .35s ease}
+  .progress .bar.indeterminate{width:35%!important;position:absolute;left:0;
+                 animation:slide 1.2s ease-in-out infinite}
+  @keyframes slide{0%{left:-35%}100%{left:100%}}
+  .progress-text{margin-top:8px;font-size:13px;color:var(--muted);text-align:center}
+
+  .status{font-size:13.5px;min-height:18px}
+  .status.err{color:var(--err)}
+  .status.ok{color:var(--green)}
+
+  .hidden{display:none!important}
+
+  .login-actions{display:flex;justify-content:flex-end;margin-top:14px}
+  .field{display:block;margin-bottom:12px}
+  .field span{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
+  input[type=text],input[type=password]{width:100%;padding:11px 13px;font:inherit;
+        border:1px solid var(--border);border-radius:10px;background:var(--card);color:var(--text)}
+  input:focus{outline:none;border-color:var(--brand);
+              box-shadow:0 0 0 3px var(--brand-soft)}
+
+  .preview{margin-top:14px}
+  .preview-toggle{background:transparent;border:none;color:var(--brand);font-weight:600;
+                  font-size:13.5px;cursor:pointer;padding:6px 0}
+  .preview-toggle:hover{text-decoration:underline}
+  .preview-body{margin-top:8px}
+  table{border-collapse:collapse;width:100%;font-size:12.5px;border-radius:8px;overflow:hidden}
+  td,th{border:1px solid var(--border);padding:6px 8px;text-align:left;vertical-align:top}
+  th{background:color-mix(in srgb,var(--muted) 10%,transparent);font-weight:600}
+  pre{white-space:pre-wrap;word-break:break-word;background:color-mix(in srgb,var(--muted) 8%,transparent);
+      padding:12px;border-radius:8px;max-height:340px;overflow:auto;font-size:12.5px;margin:0}
+
+  footer{margin-top:auto;padding:28px 0 8px;font-size:12.5px;color:var(--muted);text-align:center}
 </style>
 </head>
 <body>
-<h2>Обезличивание PDF и Excel</h2>
 
-<div id="loginBox" class="box">
-  <p><input id="login" placeholder="Логин" autocomplete="username">
-     <input id="password" type="password" placeholder="Пароль" autocomplete="current-password">
-     <button id="loginBtn">Войти</button></p>
-  <div id="loginMsg" class="err"></div>
-</div>
+<main>
+  <div class="brand">Эксойл Групп</div>
+  <h1>Обезличивание документов</h1>
 
-<div id="app" hidden>
-  <div class="box">
-    <p>
-      <input type="file" id="file" accept=".pdf,.xlsx">
-      <button id="btn">Обработать</button>
-      <button id="logout" class="muted">Выйти</button>
-    </p>
-    <div id="status" class="muted"></div>
-  </div>
+  <!-- Вход -->
+  <section id="loginBox" class="card">
+    <label class="field"><span>Логин</span>
+      <input id="login" type="text" autocomplete="username">
+    </label>
+    <label class="field"><span>Пароль</span>
+      <input id="password" type="password" autocomplete="current-password">
+    </label>
+    <div id="loginMsg" class="status err"></div>
+    <div class="login-actions">
+      <button id="loginBtn" class="btn-primary">Войти</button>
+    </div>
+  </section>
 
-  <div id="result" class="box" hidden>
-    <p><a id="dl" href="#">Скачать обезличенный файл</a></p>
-    <div id="stats" class="muted"></div>
-    <h4>Предпросмотр</h4>
-    <div id="preview"></div>
-  </div>
+  <!-- Приложение -->
+  <section id="app" class="hidden">
 
-</div>
+    <!-- Шаг 1: загрузка -->
+    <div class="card">
+      <div class="step"><span class="num">1</span>Загрузить файл</div>
+
+      <div id="drop" class="drop" tabindex="0" role="button" aria-label="Выбрать файл">
+        <div class="title">Выберите файл или перетащите сюда</div>
+        <div class="hint">PDF или Excel (.xlsx)</div>
+        <div id="fname" class="fname hidden"></div>
+        <input id="file" type="file" accept=".pdf,.xlsx" class="hidden">
+      </div>
+
+      <div class="row">
+        <button id="btn" class="btn-primary grow" disabled>Обработать</button>
+        <button id="logout" class="link-btn" type="button">Выйти</button>
+      </div>
+
+      <div id="progressWrap" class="progress-wrap hidden">
+        <div class="progress"><div id="bar" class="bar"></div></div>
+        <div id="progressText" class="progress-text"></div>
+      </div>
+
+      <div id="status" class="status" style="margin-top:10px"></div>
+    </div>
+
+    <!-- Шаг 2: скачивание -->
+    <div id="result" class="card hidden">
+      <div class="step"><span class="num">2</span>Скачать файл</div>
+
+      <a id="dl" class="btn-download" href="#">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 3v12"/><path d="M6 11l6 6 6-6"/><path d="M5 21h14"/>
+        </svg>
+        Скачать обезличенный файл
+      </a>
+
+      <div class="preview">
+        <button id="previewToggle" class="preview-toggle" type="button">Показать предпросмотр</button>
+        <div id="previewBody" class="preview-body hidden"></div>
+      </div>
+    </div>
+
+  </section>
+</main>
+
+<footer>Разработано Жданкиным А.А.</footer>
 
 <script>
+"use strict";
 const $ = id => document.getElementById(id);
-let creds = JSON.parse(sessionStorage.getItem("creds") || "null");
 
-function headers() {
-  return {"X-Login": creds.login, "X-Password": creds.password};
+let creds = null;
+try { creds = JSON.parse(sessionStorage.getItem("creds") || "null"); } catch { creds = null; }
+
+function headers() { return creds ? { "X-Login": creds.login, "X-Password": creds.password } : {}; }
+
+function showLogin() {
+  $("app").classList.add("hidden");
+  $("loginBox").classList.remove("hidden");
 }
-function msg(text, isErr) {
-  $("status").textContent = text;
-  $("status").className = isErr ? "err" : "muted";
+function showApp() {
+  $("loginBox").classList.add("hidden");
+  $("app").classList.remove("hidden");
 }
+function logout() {
+  creds = null;
+  sessionStorage.removeItem("creds");
+  showLogin();
+  resetUpload();
+}
+function resetUpload() {
+  $("file").value = "";
+  $("fname").classList.add("hidden");
+  $("fname").textContent = "";
+  $("drop").classList.remove("has-file");
+  $("btn").disabled = true;
+  $("result").classList.add("hidden");
+  $("progressWrap").classList.add("hidden");
+  $("bar").style.width = "0%";
+  $("bar").classList.remove("indeterminate");
+  $("progressText").textContent = "";
+  setStatus("", "");
+}
+
+function setStatus(text, kind) {
+  const el = $("status");
+  el.textContent = text || "";
+  el.className = "status" + (kind ? " " + kind : "");
+}
+
 async function login() {
-  const body = {login: $("login").value.trim(), password: $("password").value};
+  const login = $("login").value.trim();
+  const password = $("password").value;
+  if (!login || !password) { $("loginMsg").textContent = "Введите логин и пароль"; return; }
+  $("loginBtn").disabled = true;
+  $("loginMsg").textContent = "";
   try {
-    const r = await fetch("/api/login", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.detail || "Ошибка входа");
-    creds = body;
+    const r = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ login, password })
+    });
+    let d = {};
+    try { d = await r.json(); } catch {}
+    if (!r.ok) throw new Error(d.detail || "Неверный логин или пароль");
+    creds = { login, password };
     sessionStorage.setItem("creds", JSON.stringify(creds));
+    $("password").value = "";
     showApp();
   } catch (e) {
     $("loginMsg").textContent = e.message;
+  } finally {
+    $("loginBtn").disabled = false;
   }
 }
-function showApp() {
-  $("loginBox").hidden = true;
-  $("app").hidden = false;
-}
-$("loginBtn").onclick = login;
-$("password").onkeydown = e => { if (e.key === "Enter") login(); };
-$("logout").onclick = () => { sessionStorage.removeItem("creds"); location.reload(); };
 
-$("btn").onclick = async () => {
+$("loginBtn").addEventListener("click", login);
+$("password").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
+$("login").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
+$("logout").addEventListener("click", logout);
+
+// ---------- выбор файла ----------
+function pickFile() { $("file").click(); }
+$("drop").addEventListener("click", pickFile);
+$("drop").addEventListener("keydown", e => {
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pickFile(); }
+});
+["dragenter","dragover"].forEach(ev => $("drop").addEventListener(ev, e => {
+  e.preventDefault(); $("drop").classList.add("over");
+}));
+["dragleave","drop"].forEach(ev => $("drop").addEventListener(ev, e => {
+  e.preventDefault(); $("drop").classList.remove("over");
+}));
+$("drop").addEventListener("drop", e => {
+  const f = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f) setFile(f);
+});
+$("file").addEventListener("change", e => {
+  if (e.target.files[0]) setFile(e.target.files[0]);
+});
+
+function setFile(f) {
+  const name = (f.name || "").toLowerCase();
+  if (!name.endsWith(".pdf") && !name.endsWith(".xlsx")) {
+    setStatus("Нужен файл PDF или Excel (.xlsx)", "err");
+    $("btn").disabled = true;
+    return;
+  }
+  try {
+    const dt = new DataTransfer();
+    dt.items.add(f);
+    $("file").files = dt.files;
+  } catch {}
+  $("fname").textContent = f.name;
+  $("fname").classList.remove("hidden");
+  $("drop").classList.add("has-file");
+  $("btn").disabled = false;
+  $("result").classList.add("hidden");
+  $("progressWrap").classList.add("hidden");
+  setStatus("", "");
+}
+
+// ---------- прогресс ----------
+let progressTimer = null;
+function startProgress() {
+  $("progressWrap").classList.remove("hidden");
+  const bar = $("bar");
+  bar.classList.remove("indeterminate");
+  bar.style.width = "0%";
+  $("progressText").textContent = "Загрузка файла…";
+  let p = 0;
+  clearInterval(progressTimer);
+  progressTimer = setInterval(() => {
+    if (p < 90) {
+      p += p < 60 ? 4 : 1.2;
+      bar.style.width = Math.min(p, 90).toFixed(1) + "%";
+      if (p > 30) $("progressText").textContent = "Идёт обезличивание…";
+      if (p > 70) $("progressText").textContent = "Почти готово…";
+    }
+  }, 180);
+}
+function finishProgress(ok) {
+  clearInterval(progressTimer);
+  progressTimer = null;
+  const bar = $("bar");
+  if (ok) {
+    bar.style.width = "100%";
+    $("progressText").textContent = "Готово";
+    setTimeout(() => { $("progressWrap").classList.add("hidden"); }, 500);
+  } else {
+    bar.classList.add("indeterminate");
+    $("progressText").textContent = "";
+  }
+}
+
+// ---------- обработка ----------
+$("btn").addEventListener("click", async () => {
   const f = $("file").files[0];
-  if (!f) return msg("Выберите файл", true);
+  if (!f) { setStatus("Выберите файл", "err"); return; }
+  if (!creds) { logout(); return; }
+
   const fd = new FormData();
   fd.append("file", f);
-  msg("Обработка...");
-  $("result").hidden = true;
-  try {
-    const r = await fetch("/api/process", {method: "POST", headers: headers(), body: fd});
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.detail || "Ошибка обработки");
-    showResult(d);
-    msg("Готово за " + d.elapsed + " с");
-  } catch (e) {
-    msg("Ошибка: " + e.message, true);
-  }
-};
 
-function showResult(d) {
-  $("result").hidden = false;
+  $("btn").disabled = true;
+  $("result").classList.add("hidden");
+  setStatus("", "");
+  startProgress();
+
+  try {
+    const r = await fetch("/api/process", { method: "POST", headers: headers(), body: fd });
+    let d = {};
+    try { d = await r.json(); } catch {}
+    if (r.status === 401) { logout(); $("loginMsg").textContent = "Сессия истекла, войдите снова"; return; }
+    if (!r.ok) throw new Error(d.detail || "Не удалось обработать файл");
+    finishProgress(true);
+    renderResult(d);
+    setStatus("Файл готов к скачиванию", "ok");
+  } catch (e) {
+    finishProgress(false);
+    setStatus("Ошибка: " + e.message, "err");
+  } finally {
+    $("btn").disabled = false;
+  }
+});
+
+function renderResult(d) {
+  $("result").classList.remove("hidden");
+
   const a = $("dl");
   a.href = d.download_url;
   a.download = d.download_name || "";
-  a.onclick = async e => {
+  a.onclick = null;
+  a.addEventListener("click", async e => {
     e.preventDefault();
     try {
-      const r = await fetch(d.download_url, {headers: headers()});
-      if (!r.ok) throw new Error("Не удалось скачать");
+      const r = await fetch(d.download_url, { headers: headers() });
+      if (r.status === 401) { logout(); $("loginMsg").textContent = "Сессия истекла"; return; }
+      if (!r.ok) throw new Error("Не удалось скачать файл");
       const blob = await r.blob();
       const url = URL.createObjectURL(blob);
       const tmp = document.createElement("a");
-      tmp.href = url; tmp.download = d.download_name || "masked";
-      tmp.click(); URL.revokeObjectURL(url);
-    } catch (err) { msg("Ошибка скачивания: " + err.message, true); }
-  };
-  $("stats").textContent = "Заменено: " + d.masked;
-  const p = $("preview");
-  p.textContent = "";
-  if (d.preview_type === "excel" && Array.isArray(d.preview)) {
+      tmp.href = url;
+      tmp.download = d.download_name || "masked";
+      document.body.appendChild(tmp);
+      tmp.click();
+      tmp.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    } catch (err) {
+      setStatus("Ошибка скачивания: " + err.message, "err");
+    }
+  });
+
+  // предпросмотр — по кнопке, чтобы не засорять экран
+  const body = $("previewBody");
+  const toggle = $("previewToggle");
+  body.textContent = "";
+  body.classList.add("hidden");
+  toggle.textContent = "Показать предпросмотр";
+
+  if (d.preview_type === "excel" && Array.isArray(d.preview) && d.preview.length) {
     const t = document.createElement("table");
     d.preview.forEach((row, i) => {
       const tr = document.createElement("tr");
-      row.forEach(c => {
+      (row || []).forEach(c => {
         const el = document.createElement(i === 0 ? "th" : "td");
-        el.textContent = c;
+        el.textContent = c == null ? "" : String(c);
         tr.appendChild(el);
       });
       t.appendChild(tr);
     });
-    p.appendChild(t);
+    body.appendChild(t);
   } else {
     const pre = document.createElement("pre");
-    pre.textContent = d.preview || "(текст не извлечён — возможно, скан)";
-    p.appendChild(pre);
+    pre.textContent = d.preview || "(текст не извлечён)";
+    body.appendChild(pre);
   }
+
+  toggle.onclick = () => {
+    const hidden = body.classList.toggle("hidden");
+    toggle.textContent = hidden ? "Показать предпросмотр" : "Скрыть предпросмотр";
+  };
 }
 
-if (creds) showApp();
+// ---------- старт ----------
+if (creds) {
+  fetch("/api/me", { headers: headers() })
+    .then(r => { if (r.ok) showApp(); else logout(); })
+    .catch(() => logout());
+} else {
+  showLogin();
+}
 </script>
 </body>
 </html>
