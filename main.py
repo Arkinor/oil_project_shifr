@@ -8,6 +8,16 @@ main.py — веб-сервис обезличивания PDF/Excel с лока
     --hidden-import=pystray --hidden-import=PIL --hidden-import=PIL.Image
 и положите иконку рядом с main.py (icon.ico). Если pystray/Pillow не
 установлены — сервис работает как обычно, без трея.
+
+Контракт с фронтендом (не менять!):
+  GET  /                     -> index.html
+  POST /api/login            {login,password} -> {ok,login} | 401 "Неверный логин или пароль"
+  GET  /api/me               (X-Login,X-Password) -> {login}
+  GET  /api/health           -> {ok,model,lm_studio_url,llm_ok,rag,frozen,tray,users_count}
+  POST /api/process          multipart file     -> {ok,filename,download_name,download_url,
+                                                    elapsed,preview_type,preview,llm_used,extras,
+                                                    masked,pages}
+  GET  /api/download/{name}  (X-Login,X-Password) -> файл
 """
 import hashlib
 import hmac
@@ -134,6 +144,7 @@ CYR_LOWER = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
 LAT_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 LAT_LOWER = "abcdefghijklmnopqrstuvwxyz"
 ALL_LETTERS = CYR_LOWER + CYR_UPPER + LAT_LOWER + LAT_UPPER
+
 ORG_PREFIXES = {"ООО", "ОАО", "ЗАО", "ПАО", "АО", "ИП", "ФГУП", "ГУП", "МУП",
                 "ГБУ", "ГАУ", "АНО", "НКО", "ФОНД", "МИНИСТЕРСТВО", "ДЕПАРТАМЕНТ",
                 "УПРАВЛЕНИЕ", "КОМПАНИЯ"}
@@ -149,8 +160,20 @@ PLAIN_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("passport", re.compile(r"(?<!\d)\d{2}\s?\d{2}(?:\s*(?:№|номер)\s*|\s+)\d{6}(?!\d)", re.I)),
     ("snils", re.compile(r"(?<!\d)\d{3}[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{2}(?!\d)")),
     ("kpp", re.compile(r"(?<!\d)\d{4}[A-ZА-Я]{2}\d{3}(?!\d)", re.I)),
+    # --- Реквизиты РФ: отдельные регексы с высоким PRIORITY ---
+    # ИНН: 10 (юрлицо) или 12 (физлицо/ИП) цифр. Ловим и слитную форму "ИНН7707083893".
+    ("inn", re.compile(r"(?<!\d)(?:ИНН\s*[:\-]?\s*)?(?:\d{10}|\d{12})(?!\d)", re.I)),
+    # ОГРН 13, ОГРНИП 15
+    ("ogrn", re.compile(r"(?<!\d)(?:ОГРНИП|ОГРН)\s*[:\-]?\s*(?:\d{13}|\d{15})(?!\d)", re.I)),
+    ("ogrn_bare", re.compile(r"(?<!\d)(?:\d{13}|\d{15})(?!\d)")),
+    # БИК 9 цифр
+    ("bik", re.compile(r"(?<!\d)(?:БИК\s*[:\-]?\s*)?\d{9}(?!\d)", re.I)),
+    # Расчётный/корреспондентский счёт 20 цифр
+    ("rs", re.compile(r"(?<!\d)(?:(?:р\/с|к\/с|расч[её]тный|корр?\.?\s*сч[её]т|сч[её]т)\s*[:\-]?\s*)?\d{20}(?!\d)", re.I)),
+    # --- ФИО / организации / адреса / даты / числа ---
     ("fio", re.compile(r"(?<![А-Яа-яЁё])(?:[А-ЯЁ][а-яё]{1,20}\s+){2}[А-ЯЁ][а-яё]{1,20}(?![А-Яа-яЁё])")),
     ("fio_initials", re.compile(r"(?<![А-Яа-яЁё])[А-ЯЁ][а-яё]{1,20}\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.(?![А-Яа-яЁё])")),
+    ("fio_lat", re.compile(r"(?<![A-Za-z])(?:[A-Z][a-z]{1,20}\s+){2}[A-Z][a-z]{1,20}(?![A-Za-z])")),
     ("org", re.compile(
         r"(?<![А-Яа-яЁё])(?:ООО|ОАО|ЗАО|ПАО|АО|ИП|ФГУП|ГУП|МУП|ГБУ|ГАУ|АНО|НКО|Фонд|"
         r"Министерство|Департамент|Управление|Компания)\s+[«\"]?[А-ЯЁA-Z0-9][^\n,;]{1,100}", re.I)),
@@ -158,6 +181,9 @@ PLAIN_PATTERNS: List[Tuple[str, re.Pattern]] = [
         r"(?<![А-Яа-яЁё])(?:г\.|город|ул\.|улица|пр-т|проспект|пер\.|переулок|наб\.|набережная|"
         r"ш\.|шоссе|д\.|дом|кв\.|квартира|обл\.|область|респ\.|республика|п\.|пос\.|поселок|"
         r"с\.|село|мкр\.|микрорайон)\s*[^\n,;]{1,80}(?:,\s*[^\n;]{1,80}){0,4}", re.I)),
+    ("address_lat", re.compile(
+        r"(?<![A-Za-z])(?:st\.|street|ave\.|avenue|rd\.|road|blvd\.|boulevard|"
+        r"apt\.|apartment|suite|bldg\.|building|city|town)\s+[^\n,;]{1,80}(?:,\s*[^\n;]{1,80}){0,3}", re.I)),
     ("date", re.compile(r"(?<!\d)(?:\d{2}[./-]\d{2}[./-]\d{4}|\d{4}[./-]\d{2}[./-]\d{2})(?!\d)")),
     ("number", re.compile(r"(?<![\d.,])-?(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d+)(?:[.,]\d+)?(?![\d])")),
 ]
@@ -165,18 +191,34 @@ PLAIN_PATTERNS: List[Tuple[str, re.Pattern]] = [
 # (тип, regex, номер группы). Меняется только значение, метка сохраняется.
 GROUP_PATTERNS: List[Tuple[str, re.Pattern, int]] = [
     ("kpp", re.compile(r"(?:КПП)\s*[:\-]?\s*(\d{4}[0-9A-ZА-Я]{2}\d{3})", re.I), 1),
+    ("inn", re.compile(r"(?:ИНН)\s*[:\-]?\s*(\d{10,12})", re.I), 1),
+    ("ogrn", re.compile(r"(?:ОГРНИП|ОГРН)\s*[:\-]?\s*(\d{13,15})", re.I), 1),
+    ("bik", re.compile(r"(?:БИК)\s*[:\-]?\s*(\d{9})", re.I), 1),
+    ("rs", re.compile(r"(?:р\/с|к\/с|расч[её]тный\s*сч[её]т|корр?\.?\s*сч[её]т)\s*[:\-]?\s*(\d{20})", re.I), 1),
     ("fio", re.compile(
-        r"(?:ФИО|Ф\.И\.О\.|Сотрудник|Работник|Владелец|Директор|Главный бухгалтер)"
-        r"\s*[:\-]?\s*([А-ЯЁ][А-ЯЁа-яё. \t-]{2,80})", re.I), 1),
+        r"(?:ФИО|Ф\.И\.О\.|Сотрудник|Работник|Владелец|Директор|Главный бухгалтер|"
+        r"Заемщик|Заёмщик|Клиент|Получатель|Представитель|Подписант|Страхователь|"
+        r"Пациент|Ученик|Студент|Арендатор|Арендодатель|Продавец|Покупатель|"
+        r"Исполнитель|Заказчик|Ответственный)\s*[:\-]?\s*([А-ЯЁ][А-ЯЁа-яё. \t-]{2,80})", re.I), 1),
+    ("fio_lat", re.compile(
+        r"(?:Name|Full\s*name|Director|Owner|Employee|Customer|Borrower|Client|"
+        r"Representative|Signatory)\s*[:\-]?\s*([A-Z][A-Za-z.\t -]{2,80})", re.I), 1),
     ("org", re.compile(
-        r"(?:Организация|Наименование|Работодатель|Компания)\s*[:\-]?\s*([^\n;,]{2,150})", re.I), 1),
+        r"(?:Организация|Наименование|Работодатель|Компания|Работодатель|"
+        r"Страхователь|Продавец|Покупатель|Исполнитель|Заказчик)\s*[:\-]?\s*([^\n;,]{2,150})", re.I), 1),
     ("address", re.compile(
-        r"(?:Адрес|Место жительства|Место нахождения|Почтовый адрес)\s*[:\-]?\s*([^\n;]{5,200})", re.I), 1),
+        r"(?:Адрес|Место жительства|Место нахождения|Почтовый адрес|Место регистрации|"
+        r"Address)\s*[:\-]?\s*([^\n;]{5,200})", re.I), 1),
 ]
 
-PRIORITY = {"email": 10, "phone": 10, "passport": 9, "snils": 9, "kpp": 9,
-            "date": 8, "fio": 7, "fio_initials": 7, "org": 7, "address": 7,
-            "number": 1, "extra": 5}
+PRIORITY = {
+    "email": 10, "phone": 10,
+    "passport": 9, "snils": 9, "kpp": 9, "inn": 9, "ogrn": 9, "ogrn_bare": 9, "bik": 9, "rs": 9,
+    "date": 8,
+    "fio": 7, "fio_initials": 7, "fio_lat": 7,
+    "org": 7, "address": 7, "address_lat": 7,
+    "number": 1, "extra": 5,
+}
 
 
 def _clean_value(v: str) -> str:
@@ -208,6 +250,44 @@ def _rand_digits(n: int, leading_zero: bool = False) -> str:
     return first + "".join(random.choice("0123456789") for _ in range(n - 1))
 
 
+def _inn_checksum(digits: str) -> str:
+    """Возвращает контрольную цифру(ы) для ИНН 10/12 знаков."""
+    if len(digits) == 9:  # для 10-значного ИНН — 1 контрольная
+        weights = [2, 4, 10, 3, 5, 9, 4, 6, 8]
+        s = sum(int(d) * w for d, w in zip(digits, weights))
+        return str(s % 11 % 10)
+    if len(digits) == 11:  # для 12-значного — 2 контрольные
+        w1 = [7, 2, 4, 10, 3, 5, 9, 4, 6, 8]
+        w2 = [3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8]
+        c1 = sum(int(d) * w for d, w in zip(digits, w1)) % 11 % 10
+        c2 = sum(int(d) * w for d, w in zip(digits, w2)) % 11 % 10
+        return f"{c1}{c2}"
+    return ""
+
+
+def _ogrn_checksum(digits: str) -> str:
+    """Возвращает контрольную цифру для ОГРН (13) / ОГРНИП (15)."""
+    n = int(digits)
+    if len(digits) == 12:
+        return str(n % 11 % 10)
+    if len(digits) == 14:
+        return str(n % 13 % 10)
+    return ""
+
+
+def _snils_checksum(digits9: str) -> str:
+    total = sum(int(d) * (9 - i) for i, d in enumerate(digits9))
+    if total < 100:
+        check = total
+    elif total in (100, 101):
+        check = 0
+    else:
+        check = total % 101
+        if check == 100:
+            check = 0
+    return f"{check:02d}"
+
+
 def _infer_kind(v: str) -> str:
     s = v.strip()
     if "@" in s:
@@ -220,13 +300,26 @@ def _infer_kind(v: str) -> str:
         return "snils"
     if re.fullmatch(r"\d{4}[A-ZА-Я]{2}\d{3}", s, re.I):
         return "kpp"
+    if re.fullmatch(r"\d{10}", s) or re.fullmatch(r"\d{12}", s):
+        return "inn"
+    if re.fullmatch(r"\d{13}", s) or re.fullmatch(r"\d{15}", s):
+        return "ogrn"
+    if re.fullmatch(r"\d{9}", s):
+        return "bik"
+    if re.fullmatch(r"\d{20}", s):
+        return "rs"
     if re.search(r"(?:ООО|ОАО|ЗАО|ПАО|АО|ИП|ФГУП|ГУП|МУП|ГБУ|ГАУ|АНО|НКО|Фонд|"
                  r"Министерство|Департамент|Управление|Компания)", s, re.I):
         return "org"
     if re.search(r"(?:г\.|ул\.|д\.|кв\.|обл\.|пр-т|проспект|наб\.|ш\.|мкр\.|пос\.|с\.|респ\.)", s, re.I):
         return "address"
+    if re.search(r"(?:st\.|street|ave\.|avenue|rd\.|road|blvd\.|boulevard|apt\.|suite|bldg\.)", s, re.I):
+        return "address_lat"
     words = s.split()
     if 2 <= len(words) <= 4 and all(w[:1].isupper() for w in words if w):
+        # латиница?
+        if re.search(r"[A-Za-z]", s) and not re.search(r"[А-Яа-яЁё]", s):
+            return "fio_lat"
         return "fio"
     if re.fullmatch(r"[\d\s.,-]+", s):
         return "number"
@@ -249,7 +342,9 @@ class Masker:
     def _gen(self, kind: str, original: str) -> str:
         if kind == "extra":
             kind = _infer_kind(original)
-        if kind == "fio":
+        if kind in ("fio", "fio_lat"):
+            if kind == "fio_lat":
+                return self._fio_lat(original)
             name = ""
             for _ in range(5):
                 name = re.sub(r"^(?:г-н|г-жа|господин|госпожа)\s+", "", self.fake.name(), flags=re.I)
@@ -274,7 +369,10 @@ class Masker:
                 return "ИП " + _mix_letters(self.fake.name(), 0.05)
             name = f"{random.choice(ORG_NAMES)} {random.choice(ORG_SUFFIXES)}"
             return f"{prefix} «{name}»" if prefix else f"«{name}»"
-        if kind == "address":
+        if kind in ("address", "address_lat"):
+            if kind == "address_lat":
+                return (f"{self.fake.street_name()} St., Bldg. {self.fake.building_number()}, "
+                        f"{self.fake.city()}")
             return (f"г. {self.fake.city_name()}, {self.fake.street_name()}, "
                     f"д. {self.fake.building_number()}")
         if kind == "passport":
@@ -285,16 +383,7 @@ class Masker:
             return _rand_digits(4) + " " + _rand_digits(6)
         if kind == "snils":
             digits9 = "".join(random.choice("0123456789") for _ in range(9))
-            total = sum(int(d) * (9 - i) for i, d in enumerate(digits9))
-            if total < 100:
-                check = total
-            elif total in (100, 101):
-                check = 0
-            else:
-                check = total % 101
-                if check == 100:
-                    check = 0
-            num = digits9 + f"{check:02d}"
+            num = digits9 + _snils_checksum(digits9)
             if "-" in original:
                 return f"{num[:3]}-{num[3:6]}-{num[6:9]} {num[9:]}"
             if " " in original:
@@ -303,6 +392,28 @@ class Masker:
         if kind == "kpp":
             letters = "АБВГДЕЖЗИКЛМНОПРСТУФХЦЧШЩЭЮЯ"
             return _rand_digits(4, True) + "".join(random.choice(letters) for _ in range(2)) + _rand_digits(3)
+        if kind == "inn":
+            n = len(re.sub(r"\D", "", original))
+            if n == 10:
+                base = _rand_digits(9)
+                return base + _inn_checksum(base)
+            if n == 12:
+                base = _rand_digits(11)
+                return base + _inn_checksum(base)
+            return _rand_digits(n or 10)
+        if kind in ("ogrn", "ogrn_bare"):
+            n = len(re.sub(r"\D", "", original))
+            if n == 13:
+                base = _rand_digits(12, leading_zero=False)
+                return base + _ogrn_checksum(base)
+            if n == 15:
+                base = _rand_digits(14, leading_zero=False)
+                return base + _ogrn_checksum(base)
+            return _rand_digits(n or 13)
+        if kind == "bik":
+            return _rand_digits(9, leading_zero=False)
+        if kind == "rs":
+            return _rand_digits(20, leading_zero=False)
         if kind == "date":
             m = re.match(r"^(\d{2})([./-])(\d{2})\2(\d{4})$", original)
             if m:
@@ -317,6 +428,29 @@ class Masker:
             return self._number(original)
         return _mix_letters(" ".join(self.fake.word().capitalize()
                                      for _ in range(max(1, len(original.split())))), 0.05)
+
+    def _fio_lat(self, original: str) -> str:
+        first = self.fake.first_name_male() if random.random() < 0.5 else self.fake.first_name_female()
+        last = self.fake.last_name_male() if random.random() < 0.5 else self.fake.last_name_female()
+        # транслит через простую замену кириллицы (без внешних пакетов)
+        tr = {
+            "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+            "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+            "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+            "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+            "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+        }
+        def translit(s: str) -> str:
+            out = []
+            for ch in s:
+                low = ch.lower()
+                r = tr.get(low, ch)
+                out.append(r.capitalize() if ch.isupper() else r)
+            return "".join(out)
+        f, l = translit(first), translit(last)
+        if original.split() and original.split()[0][:1].isupper():
+            return f"{l} {f}"
+        return f"{l} {f}"
 
     @staticmethod
     def _number_once(original: str) -> str:
@@ -439,11 +573,14 @@ KNOWLEDGE: List[str] = [
     "Email — адрес вида name@example.ru. Маскировать целиком.",
     "Банковские реквизиты — расчётный счёт из 20 цифр, БИК из 9 цифр, корреспондентский счёт из 20 цифр.",
     "ФИО — три слова с заглавной буквы (Фамилия Имя Отчество) или Фамилия И.О. "
-    "Также искать значение после меток «ФИО», «Сотрудник», «Владелец», «Директор».",
+    "Также искать значение после меток «ФИО», «Сотрудник», «Владелец», «Директор», «Заемщик», "
+    "«Клиент», «Получатель», «Представитель», «Подписант».",
     "Организации — названия после ООО, АО, ПАО, ЗАО, ИП, ГУП, МУП, ГБУ, АНО, НКО, Фонд, "
     "а также после меток «Организация», «Наименование», «Работодатель».",
     "Адреса — строки после «Адрес», «Место жительства», «Место нахождения», а также конструкции "
     "с «г.», «ул.», «д.», «кв.», «обл.», «пр-т», «ш.», «мкр.». Маскировать адрес целиком.",
+    "Латиница — ФИО, адреса и организации латиницей искать аналогично кириллическим: "
+    "три слова с заглавной, маркеры Street/Ave/St/Bldg/Apt, префиксы Inc/Ltd/LLC/GmbH.",
     "Все найденные значения заменяются похожими ненастоящими значениями: ФИО — фейковое ФИО, "
     "телефон — фейковый телефон, адрес — фейковый адрес, числа — другие числа той же длины и формата. "
     "Структура документа сохраняется: таблицы, страницы и расположение текста не меняются.",
@@ -554,7 +691,6 @@ def _parse_json_array(raw: str) -> List[Any]:
                     return data[key]
         except Exception:
             pass
-    # запасной вариант: строки в кавычках или маркированный список
     quoted = re.findall(r'"([^"\n]{3,200})"', raw)
     if quoted:
         return quoted
@@ -562,25 +698,30 @@ def _parse_json_array(raw: str) -> List[Any]:
 
 
 def detect_extra_pii(text: str) -> Tuple[List[str], bool]:
-    """LLM ищет неструктурированные ПДн (ФИО, организации, адреса)."""
+    """LLM ищет неструктурированные ПДн и реквизиты как fallback для регексов."""
     s = load_settings()
     llm = get_llm(s)
     text = (text or "").strip()
     if llm is None or not text:
         return [], False
-    context = rag_search("ФИО организации адреса правила маскировки")
+    context = rag_search("ФИО организации адреса реквизиты ИНН ОГРН БИК правила маскировки")
     limit = int(s.get("max_llm_chars", 12000))
     chunks = [text[i:i + 6000] for i in range(0, min(len(text), limit), 6000)]
     text_norm = text.replace("\u00ad", "-").replace("\xa0", " ").lower()
     found: set[str] = set()
     ok = False
-    system = ("Ты — анализатор персональных данных. Отвечай только JSON-массивом строк, без пояснений. "
-              "Из текста выпиши дословно: ФИО, полные названия организаций, почтовые адреса. "
-              "Не выписывай ИНН, КПП, ОГРН, СНИЛС, паспорт, телефоны, email, счета и БИК — их обрабатывает программа. "
-              "Если ничего нет — верни []. Не придумывай значения.")
+    system = (
+        "Ты — анализатор персональных данных. Отвечай только JSON-массивом строк, без пояснений. "
+        "Из текста выпиши дословно: ФИО (кириллица и латиница), полные названия организаций, "
+        "почтовые адреса, а также реквизиты, если они есть: ИНН (10/12 цифр), ОГРН/ОГРНИП (13/15), "
+        "БИК (9), расчётный счёт (20), КПП, СНИЛС, паспорт, телефоны, email. "
+        "Выписывай значения в том виде, в котором они встречаются в тексте (с пробелами/дефисами). "
+        "Если ничего нет — верни []. Не придумывай значения."
+    )
     for chunk in chunks:
         prompt = (f"Правила:\n{context}\n\nТекст:\n{chunk}\n\n"
-                  "Верни только JSON-массив найденных строк. Пример: [\"Иванов Иван Иванович\", \"ООО Ромашка\"]")
+                  "Верни только JSON-массив найденных строк. Пример: [\"Иванов Иван Иванович\", "
+                  "\"ООО Ромашка\", \"ИНН 7707083893\", \"г. Москва, ул. Тверская, д. 1\"]")
         try:
             resp = llm.invoke([("system", system), ("human", prompt)])
             raw = resp.content if hasattr(resp, "content") else str(resp)
@@ -609,12 +750,48 @@ def extract_pdf_text(path: Path) -> str:
         doc.close()
 
 
+def _pdf_text_ratio(path: Path) -> float:
+    """Доля страниц с непустым текстом (0..1). Помогает выявить сканы."""
+    try:
+        import pymupdf
+        doc = pymupdf.open(path)
+        try:
+            if not len(doc):
+                return 0.0
+            non_empty = 0
+            for page in doc:
+                if page.get_text("text").strip():
+                    non_empty += 1
+            return non_empty / len(doc)
+        finally:
+            doc.close()
+    except Exception:
+        return 1.0
+
+
 def _cyr_font() -> str | None:
-    fonts = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
-    for name in ("arial.ttf", "segoeui.ttf", "calibri.ttf", "times.ttf", "tahoma.ttf"):
-        p = fonts / name
-        if p.exists():
-            return str(p)
+    """Ищет кириллический TTF в стандартных каталогах Windows / Linux / macOS."""
+    candidates = [
+        # Windows
+        (Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / n)
+        for n in ("arial.ttf", "segoeui.ttf", "calibri.ttf", "times.ttf", "tahoma.ttf")
+    ] + [
+        # Linux
+        Path("/usr/share/fonts/truetype/dejavu") / n for n in ("DejaVuSans.ttf", "DejaVuSerif.ttf")
+    ] + [
+        Path("/usr/share/fonts/truetype/liberation") / n for n in ("LiberationSans-Regular.ttf",)
+    ] + [
+        # macOS
+        Path("/Library/Fonts") / n for n in ("Arial.ttf", "Times New Roman.ttf")
+    ] + [
+        Path("/System/Library/Fonts/Supplemental") / n for n in ("Arial.ttf", "Times New Roman.ttf")
+    ]
+    for p in candidates:
+        try:
+            if p.exists() and p.stat().st_size > 0:
+                return str(p)
+        except Exception:
+            continue
     return None
 
 
@@ -668,8 +845,6 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict
             bbox = pymupdf.Rect(span["bbox"])
             origin = span.get("origin") or (bbox.x0, bbox.y1)
             size = float(span.get("size") or 10.0)
-            # Ближайший соседний span на той же визуальной строке ограничивает
-            # ширину: в таблицах каждая ячейка может быть отдельной строкой/блоком.
             next_x = page.rect.x1 - 18
             for other in all_spans:
                 if other is span:
@@ -732,6 +907,18 @@ def extract_excel_text(path: Path, limit: int = 20000) -> str:
     return "\n".join(parts)
 
 
+def _excel_preview(ws, max_rows: int = 8, max_cols: int = 8) -> List[List[str]]:
+    preview: List[List[str]] = []
+    try:
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i >= max_rows:
+                break
+            preview.append([("" if c is None else str(c))[:60] for c in row[:max_cols]])
+    except Exception:
+        pass
+    return preview
+
+
 def mask_excel_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict[str, Any]:
     import openpyxl
     wb = openpyxl.load_workbook(input_path)
@@ -754,30 +941,38 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = ()) -> Di
                         cell.value = v + timedelta(days=random.randint(-3650, 3650))
                         masked += 1
                     elif isinstance(v, (int, float)):
-                        fake = masker.get("number", str(v))
-                        try:
-                            cell.value = (int(fake) if isinstance(v, int)
-                                          else float(fake.replace(" ", "").replace("\u00a0", "").replace(",", ".")))
-                            masked += 1
-                        except Exception:
-                            pass
+                        # Если это похоже на реквизит (ИНН/ОГРН/БИК/р/с/КПП) — маскируем
+                        # как соответствующий тип, иначе как число.
+                        raw = str(int(v)) if isinstance(v, int) else str(v)
+                        kind = _infer_kind(raw)
+                        if kind in ("inn", "ogrn", "ogrn_bare", "bik", "rs", "kpp", "snils"):
+                            fake = masker.get(kind, raw)
+                            try:
+                                cell.value = int(fake) if isinstance(v, int) else float(fake.replace(" ", "").replace(",", "."))
+                                masked += 1
+                            except Exception:
+                                pass
+                        else:
+                            fake = masker.get("number", raw)
+                            try:
+                                cell.value = (int(fake) if isinstance(v, int)
+                                              else float(fake.replace(" ", "").replace("\u00a0", "").replace(",", ".")))
+                                masked += 1
+                            except Exception:
+                                pass
         wb.save(output_path)
-        # предпросмотр первого листа
-        preview: List[List[str]] = []
-        try:
-            ws = wb.active
-            for i, row in enumerate(ws.iter_rows(values_only=True)):
-                if i >= 8:
-                    break
-                preview.append([("" if c is None else str(c))[:60] for c in row[:8]])
-        except Exception:
-            pass
+        preview = _excel_preview(wb.active)
     finally:
         wb.close()
     return {"masked": masked, "pages": 1, "preview_rows": preview}
 
 
 def process_pdf(input_path: Path, output_path: Path) -> Dict[str, Any]:
+    warning = None
+    ratio = _pdf_text_ratio(input_path)
+    if ratio < 0.5:
+        warning = "PDF похож на скан: часть страниц без текстового слоя. OCR не поддерживается — эти страницы не будут обезличены."
+        logger.warning(f"PDF scan-like: {input_path.name}, text_pages_ratio={ratio:.2f}")
     text = extract_pdf_text(input_path)
     extras, llm_ok = detect_extra_pii(text)
     stats = mask_pdf_file(input_path, output_path, extras)
@@ -792,8 +987,11 @@ def process_pdf(input_path: Path, output_path: Path) -> Dict[str, Any]:
             doc.close()
     except Exception:
         pass
-    return {"preview_type": "pdf", "preview": preview, "llm_used": llm_ok,
-            "extras": extras[:50], **stats}
+    result: Dict[str, Any] = {"preview_type": "pdf", "preview": preview, "llm_used": llm_ok,
+                              "extras": extras[:50], **stats}
+    if warning:
+        result["warning"] = warning
+    return result
 
 
 def process_excel(input_path: Path, output_path: Path) -> Dict[str, Any]:
@@ -864,6 +1062,7 @@ def process(file: UploadFile = File(...), user: str = Depends(get_current_user))
     original = _safe_name(file.filename or "document")
     ext = Path(original).suffix.lower()
     if ext not in (".pdf", ".xlsx"):
+        # Явный и понятный отказ, в т.ч. для .xls (старый формат openpyxl не читает).
         raise HTTPException(400, "Поддерживаются только PDF и Excel (.xlsx)")
 
     max_mb = int(s.get("max_upload_mb", 50))
@@ -899,7 +1098,6 @@ def process(file: UploadFile = File(...), user: str = Depends(get_current_user))
 def download(filename: str, user: str = Depends(get_current_user)):
     name = Path(filename).name
     path = (OUTPUT_DIR / name).resolve()
-    # защита от path traversal
     if not str(path).startswith(str(OUTPUT_DIR.resolve()) + os.sep):
         raise HTTPException(400, "Недопустимое имя файла")
     if not path.exists() or not path.is_file():
@@ -911,11 +1109,10 @@ def download(filename: str, user: str = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------- трей
-TRAY_ICON = None  # заполняется, если pystray доступен
+TRAY_ICON = None
 
 
 def _tray_image():
-    """Пробует загрузить иконку, иначе рисует простой кружок."""
     from PIL import Image, ImageDraw
     base = Path(getattr(sys, "_MEIPASS", APP_DIR))
     for candidate in ("icon.ico", "icon.png", "app.ico"):
@@ -949,10 +1146,8 @@ def _open_output_dir() -> None:
 
 
 def start_tray(port: int) -> None:
-    """Запускает иконку в трее (в главном потоке). При выходе — os._exit(0)."""
     global TRAY_ICON
     if not getattr(sys, "frozen", False):
-        # в режиме разработки трей не нужен
         return
     try:
         import pystray
@@ -991,7 +1186,6 @@ def start_tray(port: int) -> None:
 
 # ---------------------------------------------------------------- запуск
 class _NoConsoleStream:
-    """Заглушка вместо sys.stdout/stderr при сборке без консоли."""
     def write(self, *args, **kwargs):
         return 0
 
@@ -1006,7 +1200,6 @@ class _NoConsoleStream:
 
 
 def _setup_file_logging() -> None:
-    """Дублирует логи uvicorn в data/server.log при frozen-сборке."""
     try:
         fh = logging.FileHandler(SERVER_LOG_FILE, encoding="utf-8")
         fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
@@ -1058,13 +1251,11 @@ def run_server() -> None:
     use_tray = frozen and bool(s.get("tray_enabled", True))
 
     if use_tray:
-        # uvicorn — в фоновом потоке, трей — в главном (требование pystray на Windows/macOS)
         server_thread = threading.Thread(
             target=_run_uvicorn, args=(host, port), daemon=True, name="uvicorn"
         )
         server_thread.start()
         start_tray(port)
-        # если трей не запустился — дождёмся сервера в главном потоке
         if TRAY_ICON is None:
             server_thread.join()
     else:
