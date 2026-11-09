@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Обезличивание документов</title>
+<style>
+  body{font:15px system-ui,Segoe UI,Arial;max-width:900px;margin:28px auto;padding:0 16px;color:#222}
+  h2{margin:0 0 14px}
+  input,button{padding:8px 10px;font-size:14px}
+  button{cursor:pointer}
+  .box{border:1px solid #ddd;border-radius:8px;padding:14px;margin:12px 0}
+  .muted{color:#666;font-size:13px}
+  table{border-collapse:collapse;width:100%;font-size:12px;margin-top:8px}
+  td,th{border:1px solid #ddd;padding:4px 6px;text-align:left;vertical-align:top}
+  pre{white-space:pre-wrap;background:#f6f6f6;padding:10px;border-radius:6px;max-height:420px;overflow:auto;font-size:12px}
+  .err{color:#b00020}
+  .ok{color:#087f23}
+  a{color:#0645ad}
+</style>
+</head>
+<body>
+<h2>Обезличивание PDF и Excel</h2>
+
+<div id="loginBox" class="box">
+  <p><input id="login" placeholder="Логин" autocomplete="username">
+     <input id="password" type="password" placeholder="Пароль" autocomplete="current-password">
+     <button id="loginBtn">Войти</button></p>
+  <div id="loginMsg" class="err"></div>
+</div>
+
+<div id="app" hidden>
+  <div class="box">
+    <div class="muted">Модель: <b id="model">—</b> · LM Studio: <span id="llm">—</span> · RAG: <span id="rag">—</span></div>
+    <p>
+      <input type="file" id="file" accept=".pdf,.xlsx">
+      <button id="btn">Обработать</button>
+      <button id="logout" class="muted">Выйти</button>
+    </p>
+    <div id="status" class="muted"></div>
+  </div>
+
+  <div id="result" class="box" hidden>
+    <p><a id="dl" href="#">Скачать обезличенный файл</a></p>
+    <div id="stats" class="muted"></div>
+    <h4>Предпросмотр</h4>
+    <div id="preview"></div>
+  </div>
+
+  <div class="box">
+    <div class="muted">AI-помощник (инструменты LangChain: поиск правил, извлечение, маскировка)</div>
+    <p><input id="chatIn" placeholder="Например: какие ПДн искать в PDF?" style="width:70%">
+       <button id="chatBtn">Спросить</button></p>
+    <pre id="chatOut" hidden></pre>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let creds = JSON.parse(sessionStorage.getItem("creds") || "null");
+
+function headers() {
+  return {"X-Login": creds.login, "X-Password": creds.password};
+}
+function msg(text, isErr) {
+  $("status").textContent = text;
+  $("status").className = isErr ? "err" : "muted";
+}
+async function health() {
+  try {
+    const r = await fetch("/api/health");
+    const d = await r.json();
+    $("model").textContent = d.model;
+    $("llm").textContent = d.llm_ok ? "подключён" : "недоступен";
+    $("llm").className = d.llm_ok ? "ok" : "err";
+    $("rag").textContent = d.rag ? "готов" : "нет";
+  } catch (e) {}
+}
+async function login() {
+  const body = {login: $("login").value.trim(), password: $("password").value};
+  try {
+    const r = await fetch("/api/login", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || "Ошибка входа");
+    creds = body;
+    sessionStorage.setItem("creds", JSON.stringify(creds));
+    showApp();
+  } catch (e) {
+    $("loginMsg").textContent = e.message;
+  }
+}
+function showApp() {
+  $("loginBox").hidden = true;
+  $("app").hidden = false;
+  health();
+}
+$("loginBtn").onclick = login;
+$("password").onkeydown = e => { if (e.key === "Enter") login(); };
+$("logout").onclick = () => { sessionStorage.removeItem("creds"); location.reload(); };
+
+$("btn").onclick = async () => {
+  const f = $("file").files[0];
+  if (!f) return msg("Выберите файл", true);
+  const fd = new FormData();
+  fd.append("file", f);
+  msg("Обработка... (локальная LLM может думать несколько минут)");
+  $("result").hidden = true;
+  try {
+    const r = await fetch("/api/process", {method: "POST", headers: headers(), body: fd});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || "Ошибка обработки");
+    showResult(d);
+    msg("Готово за " + d.elapsed + " с");
+  } catch (e) {
+    msg("Ошибка: " + e.message, true);
+  }
+};
+
+function showResult(d) {
+  $("result").hidden = false;
+  const a = $("dl");
+  a.href = d.download_url;
+  a.download = d.download_name || "";
+  a.onclick = async e => {
+    e.preventDefault();
+    try {
+      const r = await fetch(d.download_url, {headers: headers()});
+      if (!r.ok) throw new Error("Не удалось скачать");
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const tmp = document.createElement("a");
+      tmp.href = url; tmp.download = d.download_name || "masked";
+      tmp.click(); URL.revokeObjectURL(url);
+    } catch (err) { msg("Ошибка скачивания: " + err.message, true); }
+  };
+  $("stats").textContent = "Заменено: " + d.masked + " · LLM использована: " + (d.llm_used ? "да" : "нет") +
+    " · Доп. значений от LLM: " + (d.extras ? d.extras.length : 0);
+  const p = $("preview");
+  p.textContent = "";
+  if (d.preview_type === "excel" && Array.isArray(d.preview)) {
+    const t = document.createElement("table");
+    d.preview.forEach((row, i) => {
+      const tr = document.createElement("tr");
+      row.forEach(c => {
+        const el = document.createElement(i === 0 ? "th" : "td");
+        el.textContent = c;
+        tr.appendChild(el);
+      });
+      t.appendChild(tr);
+    });
+    p.appendChild(t);
+  } else {
+    const pre = document.createElement("pre");
+    pre.textContent = d.preview || "(текст не извлечён — возможно, скан)";
+    p.appendChild(pre);
+  }
+}
+
+$("chatBtn").onclick = async () => {
+  const text = $("chatIn").value.trim();
+  if (!text) return;
+  $("chatOut").hidden = false;
+  $("chatOut").textContent = "Думаю...";
+  try {
+    const r = await fetch("/api/chat", {
+      method: "POST", headers: {...headers(), "Content-Type": "application/json"},
+      body: JSON.stringify({message: text})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || "Ошибка");
+    $("chatOut").textContent = d.answer;
+  } catch (e) {
+    $("chatOut").textContent = "Ошибка: " + e.message;
+  }
+};
+
+if (creds) showApp();
+</script>
+</body>
+</html>

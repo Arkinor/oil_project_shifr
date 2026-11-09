@@ -1,0 +1,6 @@
+.venv/
+data/
+dist/
+PIIMasker.spec
+build/
+__pycache__/

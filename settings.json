@@ -1,0 +1,12 @@
+{
+  "lm_studio_url": "http://127.0.0.1:1234/v1",
+  "model": "google/gemma-4-e2b",
+  "api_key": "lm-studio",
+  "temperature": 0.0,
+  "max_tokens": 1024,
+  "request_timeout": 90,
+  "max_llm_chars": 12000,
+  "host": "0.0.0.0",
+  "port": 9321,
+  "open_browser": true
+}
