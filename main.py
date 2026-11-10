@@ -23,6 +23,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -172,6 +173,45 @@ STOP_VALUES = {
     "место", "жительства", "нахождения", "регистрации", "почтовый",
 }
 
+# Слова-заголовки таблиц/анкет: три подряд таких слова — не ФИО и не организация.
+HEADER_WORDS = {
+    "фамилия", "имя", "отчество", "фио", "организация", "наименование",
+    "адрес", "телефон", "тел", "почта", "email", "инн", "огрн", "огрнип",
+    "кпп", "бик", "снилс", "паспорт", "дата", "номер", "сумма", "итого",
+    "всего", "должность", "подпись", "расшифровка", "примечание", "код",
+    "счет", "счёт", "банк", "получатель", "плательщик", "заказчик",
+    "исполнитель", "продавец", "покупатель", "сторона", "договор", "акт",
+    "приложение", "место", "жительства", "нахождения", "регистрации",
+    "почтовый", "индекс", "город", "улица", "дом", "квартира", "корпус",
+    "строение", "область", "район", "республика", "край", "поселок",
+    "село", "микрорайон", "проспект", "переулок", "набережная", "шоссе",
+    "бульвар", "площадь", "аллея", "тупик", "проезд", "литера", "офис",
+    "помещение", "здание", "этаж", "комната", "руководитель", "директор",
+    "бухгалтер", "главный", "менеджер", "специалист", "инженер", "начальник",
+    "отдел", "отделение", "филиал", "представительство", "сотрудник",
+    "работник", "клиент", "заемщик", "заёмщик", "страхователь", "пациент",
+    "ученик", "студент", "арендатор", "арендодатель", "ответственный",
+    "подписант", "представитель", "владелец", "гражданин", "гражданка",
+    "россия", "российская", "федерация", "рф",
+    "name", "first", "last", "surname", "middle", "full", "organization",
+    "company", "address", "phone", "email", "date", "number", "signature",
+    "position", "title", "code", "amount", "total", "note", "comments",
+}
+
+
+def _is_header_like(value: str) -> bool:
+    words = re.findall(r"[А-Яа-яЁёA-Za-z]+", str(value or "").lower())
+    return bool(words) and all(w in HEADER_WORDS for w in words)
+
+
+_HEADER_SENSITIVE_KINDS = {"fio", "fio_initials", "fio_lat", "signature"}
+
+
+def _has_header_word(value: str) -> bool:
+    words = re.findall(r"[А-Яа-яЁёA-Za-z]+", str(value or "").lower())
+    return any(w in HEADER_WORDS for w in words)
+
+
 VALID_KINDS = {
     "fio", "fio_initials", "fio_lat", "surname", "name", "patronymic",
     "org", "org_name", "abbr", "address", "address_lat", "city", "street",
@@ -220,15 +260,29 @@ KIND_ALIASES = {
 
 
 _LABEL_PREFIX_RE = re.compile(
-    r"^\s*(?:ФИО|Ф\.И\.О\.|ИНН|ОГРНИП|ОГРН|КПП|БИК|СНИЛС|ПАСПОРТ(?:\s+РФ)?|"
+    r"^\s*(?:ФИО|Ф\.И\.О\.|ФАМИЛИЯ|ИМЯ|ОТЧЕСТВО|"
+    r"ИНН|ОГРНИП|ОГРН|КПП|БИК|СНИЛС|ПАСПОРТ(?:\s+РФ)?|"
     r"Р\/С|К\/С|РАСЧ[ЕЁ]ТНЫЙ\s+СЧ[ЕЁ]Т|КОРР?\.?\s*СЧ[ЕЁ]Т|ТЕЛЕФОН|ТЕЛ\.|"
     r"EMAIL|E-MAIL|АДРЕС|МЕСТО\s+ЖИТЕЛЬСТВА|МЕСТО\s+НАХОЖДЕНИЯ|"
-    r"ОРГАНИЗАЦИЯ|НАИМЕНОВАНИЕ|ПОДПИСЬ|ПОДПИСАНТ)\s*[:\-]?\s*", re.I)
+    r"ОРГАНИЗАЦИЯ|НАИМЕНОВАНИЕ|ДОЛЖНОСТЬ|ПРОФЕССИЯ|"
+    r"ДАТА\s+РОЖДЕНИЯ|РАСШИФРОВКА\s+ПОДПИСИ|"
+    r"ПОДПИСЬ|ПОДПИСАНТ|ГРАЖДАНИН|ГРАЖДАНКА|ФИЗЛИЦО)\s*[:\-]?\s*", re.I)
+
+
+_ZERO_WIDTH = "\u00ad\u200b\u200c\u200d\ufeff"
 
 
 def _clean_value(v: Any) -> str:
-    v = str(v or "").replace("\u00ad", "").replace("\xa0", " ").replace("\u2011", "-")
-    v = v.strip(" \t\r\n,;.\"'«»")
+    v = str(v or "")
+    for ch in _ZERO_WIDTH:
+        v = v.replace(ch, "")
+    v = v.replace("\xa0", " ").replace("\u2011", "-")
+    v = v.strip(" \t\r\n,;")
+    # Снимаем только парные обрамляющие кавычки: одиночная кавычка ломает поиск.
+    for left, right in (("«", "»"), ('"', '"'), ("'", "'")):
+        if len(v) >= 2 and v.startswith(left) and v.endswith(right):
+            v = v[1:-1].strip()
+            break
     v = re.sub(r"\s+", " ", v).strip()
     # Метку («ИНН», «Адрес», «ФИО» и т.п.) не заменяем — оставляем в документе.
     return _LABEL_PREFIX_RE.sub("", v, count=1).strip()
@@ -251,7 +305,7 @@ def _normalize_with_map(text: str) -> Tuple[str, List[int]]:
     out: List[str] = []
     idx: List[int] = []
     for i, ch in enumerate(text):
-        if ch == "\u00ad":
+        if ch in _ZERO_WIDTH:
             continue
         out.append(_norm_char(ch))
         idx.append(i)
@@ -299,7 +353,7 @@ def _is_bad_value(v: str) -> bool:
         return True
     if not re.search(r"[A-Za-zА-Яа-яЁё0-9]", v):
         return True
-    return v.lower() in STOP_VALUES
+    return v.lower() in STOP_VALUES or _is_header_like(v)
 
 
 def _map_kind(kind: str) -> str:
@@ -373,8 +427,17 @@ GROUP_PATTERNS: List[Tuple[str, re.Pattern, int]] = [
         r"(?:ФИО|Ф\.И\.О\.|Сотрудник|Работник|Владелец|Директор|Главный бухгалтер|"
         r"Заемщик|Заёмщик|Клиент|Получатель|Представитель|Подписант|Страхователь|"
         r"Пациент|Ученик|Студент|Арендатор|Арендодатель|Продавец|Покупатель|"
-        r"Исполнитель|Заказчик|Ответственный)\s*[:\-]?\s*"
+        r"Исполнитель|Заказчик|Ответственный|Гражданин|Гражданка|Физлицо|"
+        r"Подпись|Расшифровка\s+подписи)\s*[:\-]?\s*"
         r"([А-ЯЁ][А-ЯЁа-яё.\-]*(?:\s+[А-ЯЁ][А-ЯЁа-яё.\-]*){0,3})"), 1),
+    ("surname", re.compile(
+        r"(?:Фамилия)\s*[:\-]?\s*([А-ЯЁ][А-ЯЁа-яё\-]{1,40})", re.I), 1),
+    ("name", re.compile(
+        r"(?:Имя)\s*[:\-]?\s*([А-ЯЁ][А-ЯЁа-яё\-]{1,40})", re.I), 1),
+    ("patronymic", re.compile(
+        r"(?:Отчество)\s*[:\-]?\s*([А-ЯЁ][А-ЯЁа-яё\-]{1,40})", re.I), 1),
+    ("position", re.compile(
+        r"(?:Должность|Профессия)\s*[:\-]?\s*([А-ЯЁ][^\n;]{2,80})", re.I), 1),
     ("fio_lat", re.compile(
         r"(?:Name|Full\s*name|Director|Owner|Employee|Customer|Borrower|Client|"
         r"Representative|Signatory)\s*[:\-]?\s*([A-Z][A-Za-z.\t -]{2,80})", re.I), 1),
@@ -386,6 +449,22 @@ GROUP_PATTERNS: List[Tuple[str, re.Pattern, int]] = [
     ("address", re.compile(
         r"(?:Адрес|Место жительства|Место нахождения|Почтовый адрес|Место регистрации|"
         r"Address)\s*[:\-]?\s*([^\n;]{5,150})", re.I), 1),
+    ("city", re.compile(
+        r"(?:Город|Населённый\s+пункт|Населенный\s+пункт)\s*[:\-]?\s*"
+        r"([А-ЯЁ][^\n;,]{1,60})", re.I), 1),
+    ("street", re.compile(
+        r"(?:Улица|Проспект|Переулок|Набережная|Шоссе|Бульвар|Площадь|Аллея|"
+        r"Проезд|Тупик)\s*[:\-]?\s*([А-ЯЁ][^\n;,]{1,60})", re.I), 1),
+    ("house", re.compile(
+        r"(?:Дом|Корпус|Строение|Здание)\s*[:\-]?\s*([0-9][^\n;,]{0,20})", re.I), 1),
+    ("apartment", re.compile(
+        r"(?:Квартира|Офис|Помещение|Комната)\s*[:\-]?\s*"
+        r"([0-9][^\n;,]{0,20})", re.I), 1),
+    ("index", re.compile(
+        r"(?:Почтовый\s+индекс|Индекс)\s*[:\-]?\s*(\d{6})", re.I), 1),
+    ("birthdate", re.compile(
+        r"(?:Дата\s+рождения|Д\.\s?р\.)\s*[:\-]?\s*"
+        r"(\d{2}[./-]\d{2}[./-]\d{4}|\d{4}[./-]\d{2}[./-]\d{2})", re.I), 1),
 ]
 
 PRIORITY = {
@@ -828,9 +907,14 @@ def _add_candidate(cands: List[Tuple[int, int, str, str, int]], start: int, end:
     right = len(raw) - len(raw.rstrip())
     start += left
     end -= right
-    if end - start >= 2:
+    value = raw.strip()
+    if end - start >= 2 and not _is_header_like(value):
+        # Заголовок таблицы, склеенный со значением («Фамилия Иванов Имя»),
+        # не должен превращаться в ФИО/организацию.
+        if kind in _HEADER_SENSITIVE_KINDS and _has_header_word(value):
+            return
         prio = PRIORITY.get(kind, 0) if priority is None else priority
-        cands.append((start, end, kind, raw.strip(), prio))
+        cands.append((start, end, kind, value, prio))
 
 
 def iter_matches(text: str, extras: Any = ()) -> List[Tuple[int, int, str, str]]:
@@ -1343,14 +1427,16 @@ def _block_text(block: Dict[str, Any]) -> Tuple[str, List[Any], List[Dict[str, A
     cmap: List[Any] = []
     prev = ""
     for li, line in enumerate(block.get("lines", [])):
+        rot = _rotation_from_dir(line.get("dir") or (1, 0))
         if li > 0:
             chars.append("\n")
             cmap.append(None)
             prev = "\n"
         for span in line.get("spans", []):
             text = span.get("text", "")
-            if not text.strip():
+            if not text.strip() or span.get("_table_done") or span.get("_row_done"):
                 continue
+            span["_rot"] = rot
             si = len(spans)
             spans.append(span)
             first = text[0]
@@ -1359,7 +1445,7 @@ def _block_text(block: Dict[str, Any]) -> Tuple[str, List[Any], List[Dict[str, A
                 chars.append(" ")
                 cmap.append(None)
             for ci, ch in enumerate(text):
-                if ch == "\u00ad":
+                if ch in _ZERO_WIDTH:
                     continue
                 nc = _norm_char(ch)
                 chars.append(nc)
@@ -1404,6 +1490,343 @@ def _spans_same_line(group: List[Dict[str, Any]]) -> bool:
         return max(ys) - min(ys) <= max(2.0, 0.5 * max(sizes))
     except Exception:
         return False
+
+
+def _rotation_from_dir(direction: Any) -> int:
+    """Угол текста, кратный 90°: PyMuPDF insert_text умеет только такие."""
+    try:
+        dx, dy = float(direction[0]), float(direction[1])
+    except Exception:
+        return 0
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return 0
+    # В координатах PyMuPDF ось Y направлена вниз, поэтому знак dy меняем.
+    angle = math.degrees(math.atan2(-dy, dx)) % 360.0
+    nearest = int(round(angle / 90.0)) * 90 % 360
+    diff = abs((angle - nearest + 180.0) % 360.0 - 180.0)
+    # Небольшой наклон (сканы, «пьяный» текст) считаем горизонтальным.
+    return nearest if diff <= 3.0 else 0
+
+
+def _page_tables(page) -> List[Any]:
+    """Найденные на странице таблицы (нужны и для ширины ячеек, и для строк)."""
+    try:
+        tables = []
+        for table in page.find_tables().tables:
+            # Одна ячейка на всю страницу — обычно ложное срабатывание рамки.
+            if len(getattr(table, "cells", []) or []) >= 2:
+                tables.append(table)
+        return tables
+    except Exception:
+        return []
+
+
+def _tables_to_cells(tables: List[Any]) -> List[Any]:
+    try:
+        import pymupdf
+        return [pymupdf.Rect(cell) for table in tables
+                for cell in getattr(table, "cells", []) if cell]
+    except Exception:
+        return []
+
+
+def _containing_cell(cells: List[Any], rect) -> Any:
+    if not cells:
+        return None
+    cx = (rect.x0 + rect.x1) / 2.0
+    cy = (rect.y0 + rect.y1) / 2.0
+    best = None
+    for cell in cells:
+        if (cell.x0 - 0.5 <= cx <= cell.x1 + 0.5
+                and cell.y0 - 0.5 <= cy <= cell.y1 + 0.5):
+            if best is None or abs(cell.get_area()) < abs(best.get_area()):
+                best = cell
+    return best
+
+
+def _neighbor_limit(page_spans: List[Dict[str, Any]], span: Dict[str, Any],
+                    bbox, rot: int, page_rect) -> float:
+    """Ближайшая граница соседнего текста в направлении письма."""
+    import pymupdf
+    if rot == 90:  # текст идёт снизу вверх
+        limit = page_rect.y0 + 6.0
+        for other in page_spans:
+            if other is span:
+                continue
+            ob = pymupdf.Rect(other["bbox"])
+            if ob.y1 > bbox.y0 + 1.0:
+                continue
+            if min(bbox.x1, ob.x1) - max(bbox.x0, ob.x0) <= 0.2 * max(1.0, bbox.width):
+                continue
+            limit = max(limit, ob.y1)
+        return limit
+    if rot == 270:  # текст идёт сверху вниз
+        limit = page_rect.y1 - 6.0
+        for other in page_spans:
+            if other is span:
+                continue
+            ob = pymupdf.Rect(other["bbox"])
+            if ob.y0 < bbox.y1 - 1.0:
+                continue
+            if min(bbox.x1, ob.x1) - max(bbox.x0, ob.x0) <= 0.2 * max(1.0, bbox.width):
+                continue
+            limit = min(limit, ob.y0)
+        return limit
+    if rot == 180:  # текст идёт справа налево
+        limit = page_rect.x0 + 6.0
+        for other in page_spans:
+            if other is span:
+                continue
+            ob = pymupdf.Rect(other["bbox"])
+            if ob.x1 > bbox.x0 + 1.0:
+                continue
+            if min(bbox.y1, ob.y1) - max(bbox.y0, ob.y0) <= 0.2 * max(1.0, bbox.height):
+                continue
+            limit = max(limit, ob.x1)
+        return limit
+    limit = page_rect.x1 - 18.0
+    for other in page_spans:
+        if other is span:
+            continue
+        ob = pymupdf.Rect(other["bbox"])
+        if ob.x0 <= bbox.x0 + 1.0:
+            continue
+        if min(bbox.y1, ob.y1) - max(bbox.y0, ob.y0) <= 0.4 * min(bbox.height, ob.height):
+            continue
+        limit = min(limit, ob.x0)
+    return limit
+
+
+def _avail_width(rot: int, origin: Tuple[float, float],
+                 neighbor_limit: float, cell: Any) -> float:
+    """Доступная длина строки с учётом соседей, ячейки таблицы и края страницы."""
+    if rot == 90:
+        boundary = neighbor_limit
+        if cell is not None:
+            boundary = max(boundary, cell.y0)
+        return max(6.0, origin[1] - boundary - 2.0)
+    if rot == 270:
+        boundary = neighbor_limit
+        if cell is not None:
+            boundary = min(boundary, cell.y1)
+        return max(6.0, boundary - origin[1] - 2.0)
+    if rot == 180:
+        boundary = neighbor_limit
+        if cell is not None:
+            boundary = max(boundary, cell.x0)
+        return max(6.0, origin[0] - boundary - 2.0)
+    boundary = neighbor_limit
+    if cell is not None:
+        boundary = min(boundary, cell.x1)
+    return max(6.0, boundary - origin[0] - 2.0)
+
+
+def _mask_table_rows(tables: List[Any], page_spans: List[Dict[str, Any]],
+                     extras: Any, masker: Masker) -> int:
+    """Склеивает ячейки одной строки таблицы: ФИО может быть разбито по колонкам."""
+    import pymupdf
+    if not tables or not page_spans:
+        return 0
+    count = 0
+    used: set[int] = set()
+    for table in tables:
+        try:
+            rows = table.rows
+        except Exception:
+            continue
+        for row in rows:
+            cell_spans: List[Tuple[Any, List[Dict[str, Any]]]] = []
+            for cell in getattr(row, "cells", []) or []:
+                if not cell:
+                    continue
+                rect = pymupdf.Rect(cell)
+                inside: List[Dict[str, Any]] = []
+                for span in page_spans:
+                    if id(span) in used:
+                        continue
+                    r = pymupdf.Rect(span["bbox"])
+                    cx = (r.x0 + r.x1) / 2.0
+                    cy = (r.y0 + r.y1) / 2.0
+                    if (rect.x0 - 0.5 <= cx <= rect.x1 + 0.5
+                            and rect.y0 - 0.5 <= cy <= rect.y1 + 0.5):
+                        inside.append(span)
+                        used.add(id(span))
+                if inside:
+                    inside.sort(key=lambda s: (float(s["bbox"][1]),
+                                               float(s["bbox"][0])))
+                    cell_spans.append((rect, inside))
+            if not cell_spans:
+                continue
+            chars: List[str] = []
+            cmap: List[Any] = []
+            flat_spans: List[Dict[str, Any]] = []
+            last = ""
+            for ci, (_, inside) in enumerate(cell_spans):
+                if ci > 0:
+                    chars.append(" ")
+                    cmap.append(None)
+                    last = " "
+                for span in inside:
+                    text = span.get("text", "")
+                    if not text:
+                        continue
+                    si = len(flat_spans)
+                    flat_spans.append(span)
+                    if (chars and last and not last.isspace()
+                            and not text[0].isspace()
+                            and last.isalnum() and text[0].isalnum()):
+                        chars.append(" ")
+                        cmap.append(None)
+                    for oi, ch in enumerate(text):
+                        if ch in _ZERO_WIDTH:
+                            continue
+                        nc = _norm_char(ch)
+                        chars.append(nc)
+                        cmap.append((si, oi))
+                        last = nc
+            joined = "".join(chars)
+            matches = iter_matches(joined, extras)
+            if matches:
+                edits: Dict[int, List[Tuple[int, int, str]]] = {}
+                for start, end, kind, value in matches:
+                    pieces = _range_pieces(cmap, start, end)
+                    if not pieces:
+                        continue
+                    fake = masker.get(kind, value)
+                    originals = [flat_spans[si]["text"][a:b] for si, a, b in pieces]
+                    fakes = _distribute_fake(fake, originals)
+                    for (si, a, b), fp in zip(pieces, fakes):
+                        if fp is None:
+                            continue
+                        edits.setdefault(si, []).append((a, b, fp))
+                    count += 1
+                for si, items in edits.items():
+                    span = flat_spans[si]
+                    t = span["text"]
+                    for a, b, fp in sorted(items, key=lambda x: -x[0]):
+                        t = t[:a] + fp + t[b:]
+                    if t != span["text"]:
+                        span["_new_text"] = t
+            # Помечаем все span строки, чтобы блочный проход не обработал их повторно.
+            for _, inside in cell_spans:
+                for span in inside:
+                    span["_table_done"] = True
+                    used.add(id(span))
+    return count
+
+
+def _mask_page_rows(page_spans: List[Dict[str, Any]],
+                    span_block: Dict[int, int],
+                    extras: Any, masker: Masker) -> int:
+    """Страховка для таблиц без линий: склеивает рядом стоящие блоки одной строки.
+
+    Обычный абзац целиком лежит в одном блоке и здесь пропускается — его
+    обрабатывает _mask_block. Склеиваются только span из разных блоков,
+    расположенные на одной высоте и с небольшим горизонтальным зазором.
+    """
+    import pymupdf
+    items: List[Tuple[Dict[str, Any], Any, int]] = []
+    for span in page_spans:
+        if span.get("_drop") or span.get("_table_done") or span.get("_row_done"):
+            continue
+        try:
+            rect = pymupdf.Rect(span["bbox"])
+        except Exception:
+            continue
+        items.append((span, rect, span_block.get(id(span), -1)))
+    if len(items) < 2:
+        return 0
+    items.sort(key=lambda x: (x[1].y0, x[1].x0))
+    clusters: List[Dict[str, Any]] = []
+    for item in items:
+        placed = False
+        for cluster in clusters:
+            cr = cluster["rect"]
+            overlap = min(cr.y1, item[1].y1) - max(cr.y0, item[1].y0)
+            if overlap > 0.5 * min(cr.height, item[1].height):
+                cluster["items"].append(item)
+                cluster["rect"] = pymupdf.Rect(
+                    min(cr.x0, item[1].x0), min(cr.y0, item[1].y0),
+                    max(cr.x1, item[1].x1), max(cr.y1, item[1].y1))
+                placed = True
+                break
+        if not placed:
+            clusters.append({"items": [item], "rect": pymupdf.Rect(item[1])})
+    count = 0
+    for cluster in clusters:
+        row = sorted(cluster["items"], key=lambda x: x[1].x0)
+        runs: List[List[Tuple[Dict[str, Any], Any, int]]] = []
+        cur: List[Tuple[Dict[str, Any], Any, int]] = []
+        for item in row:
+            if not cur:
+                cur = [item]
+                continue
+            prev = cur[-1]
+            gap = item[1].x0 - prev[1].x1
+            size = max(float(prev[0].get("size") or 10.0),
+                       float(item[0].get("size") or 10.0))
+            if gap <= max(6.0, 3.0 * size):
+                cur.append(item)
+            else:
+                runs.append(cur)
+                cur = [item]
+        if cur:
+            runs.append(cur)
+        for run in runs:
+            if len(run) < 2:
+                continue
+            if len({b for _, _, b in run}) < 2:
+                continue  # обычный абзац внутри одного блока
+            chars: List[str] = []
+            cmap: List[Any] = []
+            flat_spans: List[Dict[str, Any]] = []
+            last = ""
+            for span, _, _ in run:
+                text = span.get("text", "")
+                if not text:
+                    continue
+                si = len(flat_spans)
+                flat_spans.append(span)
+                if (chars and last and not last.isspace()
+                        and not text[0].isspace()
+                        and last.isalnum() and text[0].isalnum()):
+                    chars.append(" ")
+                    cmap.append(None)
+                for oi, ch in enumerate(text):
+                    if ch in _ZERO_WIDTH:
+                        continue
+                    nc = _norm_char(ch)
+                    chars.append(nc)
+                    cmap.append((si, oi))
+                    last = nc
+            joined = "".join(chars)
+            matches = iter_matches(joined, extras)
+            if not matches:
+                continue
+            edits: Dict[int, List[Tuple[int, int, str]]] = {}
+            for start, end, kind, value in matches:
+                pieces = _range_pieces(cmap, start, end)
+                if not pieces:
+                    continue
+                fake = masker.get(kind, value)
+                originals = [flat_spans[si]["text"][a:b] for si, a, b in pieces]
+                fakes = _distribute_fake(fake, originals)
+                for (si, a, b), fp in zip(pieces, fakes):
+                    if fp is None:
+                        continue
+                    edits.setdefault(si, []).append((a, b, fp))
+                count += 1
+            for si, items_ in edits.items():
+                span = flat_spans[si]
+                t = span["text"]
+                for a, b, fp in sorted(items_, key=lambda x: -x[0]):
+                    t = t[:a] + fp + t[b:]
+                if t != span["text"]:
+                    span["_new_text"] = t
+            if edits:
+                for span, _, _ in run:
+                    span["_row_done"] = True
+    return count
 
 
 def _mask_block(block: Dict[str, Any], extras: Any, masker: Masker) -> int:
@@ -1458,6 +1881,117 @@ def _mask_block(block: Dict[str, Any], extras: Any, masker: Masker) -> int:
     return count
 
 
+def _scrub_pdf_annotations(page, extras: Any, masker: Masker) -> int:
+    """Комментарии, подписи полей форм и ссылки тоже могут содержать ПДн."""
+    masked = 0
+    try:
+        for annot in page.annots() or []:
+            try:
+                info = dict(annot.info or {})
+                changed = False
+                for key in ("content", "title", "subject"):
+                    value = info.get(key) or ""
+                    if not value:
+                        continue
+                    new = mask_text(value, extras, masker)
+                    if new == value:
+                        new = ""  # лучше потерять текст комментария, чем оставить ПДн
+                    info[key] = new
+                    changed = True
+                if changed:
+                    annot.set_info(info)
+                    masked += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        for widget in page.widgets() or []:
+            try:
+                value = widget.field_value
+                if isinstance(value, str) and value:
+                    new = mask_text(value, extras, masker)
+                    if new == value:
+                        new = ""
+                    widget.field_value = new
+                    widget.update()
+                    masked += 1
+                label = getattr(widget, "field_label", None)
+                if isinstance(label, str) and label:
+                    new_label = mask_text(label, extras, masker)
+                    if new_label == label:
+                        new_label = ""
+                    widget.field_label = new_label
+                    widget.update()
+                    masked += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        for link in page.get_links() or []:
+            uri = link.get("uri")
+            if isinstance(uri, str) and uri:
+                kinds = {k for _, _, k, _ in iter_matches(uri, extras)}
+                # Числа в URL не трогаем, иначе ссылка перестанет открываться.
+                if kinds & {"email", "phone", "fio", "fio_lat", "org",
+                            "address", "address_lat"}:
+                    new = mask_text(uri, extras, masker)
+                    if new != uri:
+                        link["uri"] = new
+                        page.update_link(link)
+                        masked += 1
+    except Exception:
+        pass
+    return masked
+
+
+def _scrub_pdf_metadata(doc, extras: Any, masker: Masker) -> int:
+    """Убирает ПДн из свойств документа, XMP и закладок."""
+    masked = 0
+    try:
+        meta = doc.metadata or {}
+        if any(meta.get(k) for k in ("title", "author", "subject", "keywords",
+                                     "creator", "producer", "creationDate", "modDate")):
+            masked += 1
+        doc.set_metadata({
+            "title": "",
+            "author": "",
+            "subject": "",
+            "keywords": "",
+            "creator": "PII Masker",
+            "producer": "PII Masker",
+            "creationDate": "",
+            "modDate": "",
+        })
+    except Exception:
+        pass
+    try:
+        doc.del_xml_metadata()
+        masked += 1
+    except Exception:
+        try:
+            doc.set_xml_metadata("")
+            masked += 1
+        except Exception:
+            pass
+    try:
+        toc = doc.get_toc(simple=False)
+        changed = False
+        for item in toc:
+            if len(item) >= 2 and item[1]:
+                new_title = mask_text(str(item[1]), extras, masker)
+                if new_title != item[1]:
+                    item[1] = new_title
+                    changed = True
+                    masked += 1
+        if changed:
+            doc.set_toc(toc)
+    except Exception:
+        pass
+    return masked
+
+
 def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict[str, Any]:
     """Заменяет ПДн в PDF: ищет сущности по всему блоку и перерисовывает затронутые span.
 
@@ -1476,15 +2010,24 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict
         page_dict = page.get_text("dict")
         blocks = page_dict.get("blocks", [])
         page_spans: List[Dict[str, Any]] = []
-        for block in blocks:
+        span_block: Dict[int, int] = {}
+        for bi, block in enumerate(blocks):
             for line in block.get("lines", []):
+                rot = _rotation_from_dir(line.get("dir") or (1, 0))
                 for span in line.get("spans", []):
+                    span["_rot"] = rot
+                    span_block[id(span)] = bi
                     if span.get("text", "").strip():
                         page_spans.append(span)
+        tables = _page_tables(page)
+        table_cells = _tables_to_cells(tables)
+        if tables:
+            total += _mask_table_rows(tables, page_spans, extras, masker)
+        total += _mask_page_rows(page_spans, span_block, extras, masker)
         for block in blocks:
             total += _mask_block(block, extras, masker)
         jobs: List[Tuple[List[Any], Tuple[float, float], float, str,
-                         Tuple[float, float, float], str | None]] = []
+                         Tuple[float, float, float], str | None, int]] = []
         consumed: set[int] = set()
         for span in page_spans:
             if span.get("_drop") or id(span) in consumed:
@@ -1494,23 +2037,37 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict
                 rects = [pymupdf.Rect(s["bbox"]) for s in group]
                 x0 = min(r.x0 for r in rects)
                 x1 = max(r.x1 for r in rects)
-                origin = span.get("origin") or (x0, max(r.y1 for r in rects))
+                y0 = min(r.y0 for r in rects)
+                y1 = max(r.y1 for r in rects)
+                origin = span.get("origin") or (x0, y1)
                 size = float(span.get("size") or 10.0)
                 flags = int(span.get("flags") or 0)
+                rot = int(span.get("_rot") or 0)
                 path = _font_path(bool(flags & 16), bool(flags & 2))
                 draw_text = str(span.get("_merge_text") or "")
+                cell = _containing_cell(table_cells, pymupdf.Rect(x0, y0, x1, y1))
                 fs = size
+                if rot in (90, 270):
+                    avail = max(12.0, y1 - y0 - 2.0)
+                elif rot == 180:
+                    avail = max(12.0, x1 - x0 - 2.0)
+                else:
+                    avail = max(12.0, x1 - x0 - 2.0)
+                if cell is not None:
+                    if rot in (90, 270):
+                        avail = min(avail, max(6.0, cell.y1 - cell.y0 - 2.0))
+                    else:
+                        avail = min(avail, max(6.0, cell.x1 - cell.x0 - 2.0))
                 if path:
                     font = pymupdf.Font(fontfile=path)
                     width = _text_width(font, draw_text, fs)
-                    avail = max(12.0, x1 - x0 - 2)
                     if width > avail > 0:
                         fs = max(4.0, fs * avail / width)
                 else:
                     fs = max(4.0, min(11.0, size))
                     draw_text = MASK
                 jobs.append((rects, (float(origin[0]), float(origin[1])), fs,
-                             draw_text, _span_color(span), path))
+                             draw_text, _span_color(span), path, rot))
                 consumed.update(id(s) for s in group)
                 continue
             new_text = span.get("_new_text")
@@ -1519,17 +2076,11 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict
             bbox = pymupdf.Rect(span["bbox"])
             origin = span.get("origin") or (bbox.x0, bbox.y1)
             size = float(span.get("size") or 10.0)
-            next_x = page.rect.x1 - 18
-            for other in page_spans:
-                if other is span:
-                    continue
-                ob = pymupdf.Rect(other["bbox"])
-                if ob.x0 <= bbox.x0 + 1:
-                    continue
-                overlap = min(bbox.y1, ob.y1) - max(bbox.y0, ob.y0)
-                if overlap > 0.4 * min(bbox.height, ob.height):
-                    next_x = min(next_x, ob.x0)
-            avail = max(12.0, next_x - bbox.x0 - 2)
+            rot = int(span.get("_rot") or 0)
+            cell = _containing_cell(table_cells, bbox)
+            limit = _neighbor_limit(page_spans, span, bbox, rot, page.rect)
+            avail = _avail_width(rot, (float(origin[0]), float(origin[1])),
+                                 limit, cell)
             flags = int(span.get("flags") or 0)
             path = _font_path(bool(flags & 16), bool(flags & 2))
             fs = size
@@ -1543,10 +2094,11 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict
                 fs = max(4.0, min(11.0, size))
                 draw_text = MASK
             jobs.append(([bbox], (float(origin[0]), float(origin[1])), fs,
-                         draw_text, _span_color(span), path))
+                         draw_text, _span_color(span), path, rot))
         if not jobs:
+            total += _scrub_pdf_annotations(page, extras, masker)
             continue
-        for rects, _, _, _, _, _ in jobs:
+        for rects, _, _, _, _, _, _ in jobs:
             for bbox in rects:
                 page.add_redact_annot(bbox, fill=None)
         page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
@@ -1560,32 +2112,103 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict
                 fontnames[path] = fn
             except Exception:
                 pass
-        for _, origin, fs, draw_text, color, path in jobs:
+        for _, origin, fs, draw_text, color, path, rot in jobs:
             if path and path in fontnames:
                 page.insert_text(origin, draw_text, fontname=fontnames[path],
-                                 fontsize=fs, color=color)
+                                 fontsize=fs, color=color, rotate=rot)
             else:
-                page.insert_text(origin, MASK, fontname="helv", fontsize=fs, color=color)
+                page.insert_text(origin, MASK, fontname="helv", fontsize=fs,
+                                 color=color, rotate=rot)
+        total += _scrub_pdf_annotations(page, extras, masker)
+    total += _scrub_pdf_metadata(doc, extras, masker)
     doc.save(output_path, garbage=3, deflate=True)
     doc.close()
     return {"masked": total, "pages": pages}
 
-def extract_excel_text(path: Path, limit: int = 20000) -> str:
+def _excel_cell_text(v: Any) -> str | None:
+    """Текст ячейки, включая rich text; None для чисел/дат/формул."""
+    if isinstance(v, str):
+        return v
+    try:
+        from openpyxl.cell.rich_text import CellRichText
+        if isinstance(v, CellRichText):
+            return "".join(getattr(block, "text", str(block)) for block in v)
+    except Exception:
+        pass
+    return None
+
+
+def _header_footer_parts(ws):
+    for attr in ("oddHeader", "evenHeader", "firstHeader",
+                 "oddFooter", "evenFooter", "firstFooter"):
+        hf = getattr(ws, attr, None)
+        if hf is None:
+            continue
+        for name in ("left", "center", "right"):
+            part = getattr(hf, name, None)
+            if part is not None:
+                yield part
+
+
+def _mask_formula_strings(formula: str, extras: Any, masker: Masker) -> str:
+    """Маскирует ПДн в строковых литералах формул, не трогая ссылки и числа."""
+    def repl(m: re.Match) -> str:
+        inner = m.group(1)
+        new = mask_text(inner, extras, masker)
+        return '"' + (new if new != inner else inner) + '"'
+    try:
+        return re.sub(r'"([^"]*)"', repl, formula)
+    except Exception:
+        return formula
+
+
+def _to_number(text: str, as_int: bool):
+    """Преобразует фейковую строку с любыми разделителями в число для ячейки."""
+    s = str(text).replace("\u00a0", "").replace(" ", "")
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    else:
+        s = s.replace(",", ".")
+    value = float(s)
+    return int(round(value)) if as_int else value
+
+
+def extract_excel_text(path: Path, limit: int = 30000) -> str:
     import openpyxl
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    parts, size = [], 0
+    parts: List[str] = []
+    size = 0
     try:
         for ws in wb.worksheets:
             for row in ws.iter_rows(values_only=True):
+                # Склеиваем ячейки строки через пробел: ФИО/организация могут быть
+                # разбиты по колонкам, и LLM должна видеть их как одну сущность.
+                vals: List[str] = []
                 for v in row:
                     if v is None:
                         continue
-                    s = str(v)
+                    s = _excel_cell_text(v)
+                    if s is None:
+                        s = str(v)
                     if s.strip():
-                        parts.append(s)
-                        size += len(s) + 1
-                        if size >= limit:
-                            return "\n".join(parts)
+                        vals.append(s.strip())
+                if vals:
+                    line = " ".join(vals)
+                    parts.append(line)
+                    size += len(line) + 1
+                    if size >= limit:
+                        return "\n".join(parts)
+            try:
+                for part in _header_footer_parts(ws):
+                    text = getattr(part, "text", "") or ""
+                    if text.strip():
+                        parts.append(text)
+                        size += len(text) + 1
+            except Exception:
+                pass
     finally:
         wb.close()
     return "\n".join(parts)
@@ -1603,6 +2226,34 @@ def _excel_preview(ws, max_rows: int = 8, max_cols: int = 8) -> List[List[str]]:
     return preview
 
 
+def _scrub_excel_properties(wb, masker: Masker, extras: Any) -> int:
+    """Чистит свойства документа: автор, тема, описание и пользовательские поля."""
+    masked = 0
+    try:
+        props = wb.properties
+        for attr in ("creator", "lastModifiedBy"):
+            if getattr(props, attr, None):
+                setattr(props, attr, "PII Masker")
+                masked += 1
+        for attr in ("title", "subject", "description", "keywords", "category", "identifier"):
+            if getattr(props, attr, None):
+                setattr(props, attr, "")
+                masked += 1
+    except Exception:
+        pass
+    try:
+        for prop in getattr(wb, "custom_doc_props", []) or []:
+            value = getattr(prop, "value", None)
+            if isinstance(value, str) and value:
+                new = mask_text(value, extras, masker)
+                if new != value:
+                    prop.value = new
+                    masked += 1
+    except Exception:
+        pass
+    return masked
+
+
 def mask_excel_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict[str, Any]:
     import openpyxl
     wb = openpyxl.load_workbook(input_path)
@@ -1611,15 +2262,56 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = ()) -> Di
     try:
         for ws in wb.worksheets:
             for row in ws.iter_rows():
-                cells: List[Tuple[Any, str]] = []
+                # Комментарии и цели гиперссылок — отдельно от значений.
+                for cell in row:
+                    try:
+                        comment = cell.comment
+                        if comment is not None and comment.text:
+                            new = mask_text(comment.text, extras, masker)
+                            if new != comment.text:
+                                comment.text = new
+                                try:
+                                    comment.author = "PII Masker"
+                                except Exception:
+                                    pass
+                                masked += 1
+                    except Exception:
+                        pass
+                    try:
+                        link = cell.hyperlink
+                        target = getattr(link, "target", None) if link is not None else None
+                        if isinstance(target, str) and target:
+                            kinds = {k for _, _, k, _ in iter_matches(target, extras)}
+                            if kinds & {"email", "phone", "fio", "fio_lat", "org",
+                                        "address", "address_lat"}:
+                                new = mask_text(target, extras, masker)
+                                if new != target:
+                                    link.target = new
+                                    masked += 1
+                    except Exception:
+                        pass
+                entries: List[Any] = []
                 for cell in row:
                     v = cell.value
                     if v is None or isinstance(v, bool):
+                        entries.append(None)
                         continue
-                    if isinstance(v, str):
-                        if v and not v.startswith("="):
-                            cells.append((cell, v))
-                    elif isinstance(v, (datetime_cls, date_cls)):
+                    text = _excel_cell_text(v)
+                    if text is not None:
+                        if text and text.startswith("="):
+                            # Формулу не ломаем, но строковые литералы внутри неё чистим.
+                            new_formula = _mask_formula_strings(text, extras, masker)
+                            if new_formula != text:
+                                cell.value = new_formula
+                                masked += 1
+                            entries.append(None)
+                        elif text:
+                            entries.append((cell, text))
+                        else:
+                            entries.append(None)
+                        continue
+                    entries.append(None)
+                    if isinstance(v, (datetime_cls, date_cls)):
                         cell.value = v + timedelta(days=random.randint(-3650, 3650))
                         masked += 1
                     elif isinstance(v, (int, float)):
@@ -1627,34 +2319,46 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = ()) -> Di
                         kind = _infer_kind(raw)
                         if kind in ("inn", "ogrn", "ogrn_bare", "bik", "rs", "kpp", "snils"):
                             fake = masker.get(kind, raw)
-                            try:
-                                cell.value = int(fake) if isinstance(v, int) else float(
-                                    fake.replace(" ", "").replace(",", "."))
-                                masked += 1
-                            except Exception:
-                                pass
                         else:
                             fake = masker.get("number", raw)
+                        try:
+                            new_value = _to_number(fake, isinstance(v, int))
+                            if new_value != v:
+                                cell.value = new_value
+                                masked += 1
+                        except Exception:
                             try:
-                                cell.value = (int(fake) if isinstance(v, int) else float(
-                                    fake.replace(" ", "").replace("\u00a0", "").replace(",", ".")))
+                                if isinstance(v, int):
+                                    cell.value = random.randint(
+                                        1, max(1, 10 ** len(str(abs(v)))) - 1)
+                                else:
+                                    cell.value = round(
+                                        random.uniform(0, max(1.0, abs(v) * 10)), 2)
                                 masked += 1
                             except Exception:
                                 pass
-                if not cells:
-                    continue
-                # Склеиваем строку таблицы: ФИО/организация могут лежать в соседних ячейках.
+                # Склеиваем все непустые текстовые ячейки строки через пробел:
+                # ФИО/организация могут быть разбиты по колонкам, в том числе
+                # через пустые ячейки. Ложные срабатывания безопаснее пропуска ПДн.
+                cells: List[Tuple[Any, str]] = []
                 chars: List[str] = []
                 cmap: List[Any] = []
-                for ci, (_, value) in enumerate(cells):
-                    if ci > 0:
+                for entry in entries:
+                    if entry is None:
+                        continue
+                    cell, value = entry
+                    ci = len(cells)
+                    cells.append((cell, value))
+                    if chars:
                         chars.append(" ")
                         cmap.append(None)
                     for oi, ch in enumerate(value):
-                        if ch == "\u00ad":
+                        if ch in _ZERO_WIDTH:
                             continue
                         chars.append(_norm_char(ch))
                         cmap.append((ci, oi))
+                if not cells:
+                    continue
                 joined = "".join(chars)
                 matches = iter_matches(joined, extras)
                 if not matches:
@@ -1678,7 +2382,21 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = ()) -> Di
                         t = t[:a] + fp + t[b:]
                     if t != value:
                         cell.value = t
+                        try:
+                            if cell.hyperlink is not None:
+                                cell.hyperlink = None  # ссылка может содержать исходный email/URL
+                        except Exception:
+                            pass
                         masked += 1
+            # Колонтитулы листа тоже могут содержать ФИО/название организации.
+            for part in _header_footer_parts(ws):
+                text = getattr(part, "text", "") or ""
+                if text:
+                    new = mask_text(text, extras, masker)
+                    if new != text:
+                        part.text = new
+                        masked += 1
+        masked += _scrub_excel_properties(wb, masker, extras)
         wb.save(output_path)
         preview = _excel_preview(wb.active)
     finally:
