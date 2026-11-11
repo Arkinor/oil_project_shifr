@@ -82,6 +82,29 @@
   .status.err{color:var(--err)}
   .status.ok{color:var(--green)}
 
+  .files-table{font-size:13px}
+  .files-table td,.files-table th{padding:8px 10px;vertical-align:middle}
+  .files-table .fname{font-weight:600;word-break:break-all}
+  .files-table .muted{color:var(--muted);white-space:nowrap}
+  .status-pill{display:inline-block;padding:3px 9px;border-radius:999px;
+               font-size:12px;font-weight:600;white-space:nowrap}
+  .status-pending{background:color-mix(in srgb,var(--muted) 12%,transparent);color:var(--muted)}
+  .status-processing{background:var(--brand-soft);color:var(--brand)}
+  .status-done{background:color-mix(in srgb,var(--green) 14%,transparent);color:var(--green)}
+  .status-error{background:color-mix(in srgb,var(--err) 12%,transparent);color:var(--err)}
+  .prog{--p:0;width:46px;height:46px;border-radius:50%;flex:none;
+        background:conic-gradient(var(--brand) calc(var(--p)*1%), var(--border) 0);
+        display:flex;align-items:center;justify-content:center;transition:background .25s}
+  .prog span{width:36px;height:36px;border-radius:50%;background:var(--card);
+             display:flex;align-items:center;justify-content:center;
+             font-size:11px;font-weight:700;color:var(--text)}
+  .prog.err{background:conic-gradient(var(--err) calc(var(--p)*1%), var(--border) 0)}
+  .file-error{display:block;font-size:11.5px;color:var(--err);margin-top:2px;font-weight:400}
+  .file-note{display:block;font-size:11.5px;color:var(--muted);margin-top:2px;font-weight:400}
+  .btn-row{font-size:12.5px;padding:7px 12px;border-radius:8px;white-space:nowrap}
+  .btn-row-dl{background:var(--green);color:#fff}
+  .btn-row-dl:hover:not(:disabled){background:var(--green-h)}
+
   .hidden{display:none!important}
 
   .login-actions{display:flex;justify-content:flex-end;margin-top:14px}
@@ -131,42 +154,47 @@
 
     <!-- Шаг 1: загрузка -->
     <div class="card">
-      <div class="step"><span class="num">1</span>Загрузить файл</div>
+      <div class="step"><span class="num">1</span>Загрузить файлы</div>
 
-      <div id="drop" class="drop" tabindex="0" role="button" aria-label="Выбрать файл">
-        <div class="title">Выберите файл или перетащите сюда</div>
-        <div class="hint">PDF или Excel (.xlsx)</div>
+      <div id="drop" class="drop" tabindex="0" role="button" aria-label="Выбрать файлы">
+        <div class="title">Выберите файлы или перетащите сюда</div>
+        <div class="hint">PDF или Excel (.xlsx) — можно несколько файлов сразу</div>
         <div id="fname" class="fname hidden"></div>
-        <input id="file" type="file" accept=".pdf,.xlsx" class="hidden">
+        <input id="file" type="file" accept=".pdf,.xlsx" multiple class="hidden">
       </div>
 
       <div class="row">
-        <button id="btn" class="btn-primary grow" disabled>Обработать</button>
+        <button id="btn" class="btn-primary grow" disabled>Обработать все</button>
         <button id="logout" class="link-btn" type="button">Выйти</button>
-      </div>
-
-      <div id="progressWrap" class="progress-wrap hidden">
-        <div class="progress"><div id="bar" class="bar"></div></div>
-        <div id="progressText" class="progress-text"></div>
       </div>
 
       <div id="status" class="status" style="margin-top:10px"></div>
     </div>
 
-    <!-- Шаг 2: скачивание -->
+    <!-- Шаг 2: таблица файлов и скачивание по мере готовности -->
     <div id="result" class="card hidden">
-      <div class="step"><span class="num">2</span>Скачать файл</div>
+      <div class="step"><span class="num">2</span>Файлы</div>
 
-      <a id="dl" class="btn-download" href="#">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-             stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M12 3v12"/><path d="M6 11l6 6 6-6"/><path d="M5 21h14"/>
-        </svg>
-        Скачать обезличенный файл
-      </a>
+      <div style="overflow-x:auto">
+        <table class="files-table">
+          <thead>
+            <tr>
+              <th>Файл</th>
+              <th>Размер</th>
+              <th>Статус</th>
+              <th>Прогресс</th>
+              <th>Время</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="filesBody"></tbody>
+        </table>
+      </div>
+
+      <div id="summary" class="status" style="margin-top:10px"></div>
 
       <div class="preview">
-        <button id="previewToggle" class="preview-toggle" type="button">Показать предпросмотр</button>
+        <button id="previewToggle" class="preview-toggle hidden" type="button">Показать предпросмотр последнего файла</button>
         <div id="previewBody" class="preview-body hidden"></div>
       </div>
     </div>
@@ -200,16 +228,19 @@ function logout() {
   resetUpload();
 }
 function resetUpload() {
+  for (const item of queue) if (item.timer) clearInterval(item.timer);
+  queue = [];
   $("file").value = "";
+  $("filesBody").textContent = "";
   $("fname").classList.add("hidden");
   $("fname").textContent = "";
   $("drop").classList.remove("has-file");
   $("btn").disabled = true;
   $("result").classList.add("hidden");
-  $("progressWrap").classList.add("hidden");
-  $("bar").style.width = "0%";
-  $("bar").classList.remove("indeterminate");
-  $("progressText").textContent = "";
+  $("summary").textContent = "";
+  $("previewBody").textContent = "";
+  $("previewBody").classList.add("hidden");
+  $("previewToggle").classList.add("hidden");
   setStatus("", "");
 }
 
@@ -250,11 +281,15 @@ $("password").addEventListener("keydown", e => { if (e.key === "Enter") login();
 $("login").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
 $("logout").addEventListener("click", logout);
 
-// ---------- выбор файла ----------
-function pickFile() { $("file").click(); }
-$("drop").addEventListener("click", pickFile);
+// ---------- выбор файлов ----------
+let queue = [];
+let processing = false;
+let nextFileId = 1;
+
+function pickFiles() { $("file").click(); }
+$("drop").addEventListener("click", pickFiles);
 $("drop").addEventListener("keydown", e => {
-  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pickFile(); }
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pickFiles(); }
 });
 ["dragenter","dragover"].forEach(ev => $("drop").addEventListener(ev, e => {
   e.preventDefault(); $("drop").classList.add("over");
@@ -262,132 +297,275 @@ $("drop").addEventListener("keydown", e => {
 ["dragleave","drop"].forEach(ev => $("drop").addEventListener(ev, e => {
   e.preventDefault(); $("drop").classList.remove("over");
 }));
-$("drop").addEventListener("drop", e => {
-  const f = e.dataTransfer.files && e.dataTransfer.files[0];
-  if (f) setFile(f);
-});
+$("drop").addEventListener("drop", e => addFiles(e.dataTransfer.files));
 $("file").addEventListener("change", e => {
-  if (e.target.files[0]) setFile(e.target.files[0]);
+  addFiles(e.target.files);
+  e.target.value = "";
 });
 
-function setFile(f) {
-  const name = (f.name || "").toLowerCase();
-  if (!name.endsWith(".pdf") && !name.endsWith(".xlsx")) {
-    setStatus("Нужен файл PDF или Excel (.xlsx)", "err");
-    $("btn").disabled = true;
+function formatSize(bytes) {
+  if (bytes == null) return "—";
+  if (bytes < 1024) return bytes + " Б";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " КБ";
+  return (bytes / (1024 * 1024)).toFixed(1) + " МБ";
+}
+
+function createRow(item) {
+  const tr = document.createElement("tr");
+
+  const nameTd = document.createElement("td");
+  nameTd.className = "fname";
+  nameTd.textContent = item.file.name;
+
+  const sizeTd = document.createElement("td");
+  sizeTd.className = "muted";
+  sizeTd.textContent = formatSize(item.file.size);
+
+  const statusTd = document.createElement("td");
+  const progressTd = document.createElement("td");
+  progressTd.innerHTML = '<div class="prog"><span>0%</span></div>';
+  const timeTd = document.createElement("td");
+  timeTd.className = "muted";
+  const actionTd = document.createElement("td");
+
+  tr.appendChild(nameTd);
+  tr.appendChild(sizeTd);
+  tr.appendChild(statusTd);
+  tr.appendChild(progressTd);
+  tr.appendChild(timeTd);
+  tr.appendChild(actionTd);
+  $("filesBody").appendChild(tr);
+
+  item.pct = 0;
+  item.timer = null;
+  item.els = { status: statusTd, progress: progressTd, time: timeTd, action: actionTd };
+  return tr;
+}
+
+function addFiles(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+
+  const skipped = [];
+  let added = 0;
+  for (const f of files) {
+    const name = (f.name || "").toLowerCase();
+    if (!name.endsWith(".pdf") && !name.endsWith(".xlsx")) { skipped.push(f.name); continue; }
+    const dup = queue.some(q => q.file.name === f.name && q.file.size === f.size &&
+                               q.file.lastModified === f.lastModified);
+    if (dup) continue;
+    const item = { id: nextFileId++, file: f, status: "pending", error: "",
+                   note: "", elapsed: null, downloadUrl: "", downloadName: "" };
+    createRow(item);
+    queue.push(item);
+    updateRow(item);
+    added++;
+  }
+
+  if (skipped.length) {
+    setStatus("Пропущены (нужен PDF или .xlsx): " + skipped.join(", "), "err");
+  } else if (added) {
+    setStatus("", "");
+  }
+
+  updateSelectedInfo();
+  if (queue.length) $("result").classList.remove("hidden");
+  updateSummary();
+  updateButton();
+}
+
+function updateSelectedInfo() {
+  const n = queue.length;
+  if (!n) {
+    $("fname").textContent = "";
+    $("fname").classList.add("hidden");
+    $("drop").classList.remove("has-file");
     return;
   }
-  try {
-    const dt = new DataTransfer();
-    dt.items.add(f);
-    $("file").files = dt.files;
-  } catch {}
-  $("fname").textContent = f.name;
+  $("fname").textContent = n === 1 ? queue[0].file.name : "Выбрано файлов: " + n;
   $("fname").classList.remove("hidden");
   $("drop").classList.add("has-file");
-  $("btn").disabled = false;
-  $("result").classList.add("hidden");
-  $("progressWrap").classList.add("hidden");
-  setStatus("", "");
 }
 
-// ---------- прогресс ----------
-let progressTimer = null;
-function startProgress() {
-  $("progressWrap").classList.remove("hidden");
-  const bar = $("bar");
-  bar.classList.remove("indeterminate");
-  bar.style.width = "0%";
-  $("progressText").textContent = "Загрузка файла…";
-  let p = 0;
-  clearInterval(progressTimer);
-  progressTimer = setInterval(() => {
-    if (p < 90) {
-      p += p < 60 ? 4 : 1.2;
-      bar.style.width = Math.min(p, 90).toFixed(1) + "%";
-      if (p > 30) $("progressText").textContent = "Идёт обезличивание…";
-      if (p > 70) $("progressText").textContent = "Почти готово…";
-    }
-  }, 180);
+function renderProgress(item, pct) {
+  const el = item.els.progress.firstChild;
+  const p = Math.max(0, Math.min(100, Math.round(pct)));
+  item.pct = p;
+  el.style.setProperty("--p", p);
+  el.firstChild.textContent = p + "%";
+  el.classList.toggle("err", item.status === "error");
 }
-function finishProgress(ok) {
-  clearInterval(progressTimer);
-  progressTimer = null;
-  const bar = $("bar");
-  if (ok) {
-    bar.style.width = "100%";
-    $("progressText").textContent = "Готово";
-    setTimeout(() => { $("progressWrap").classList.add("hidden"); }, 500);
-  } else {
-    bar.classList.add("indeterminate");
-    $("progressText").textContent = "";
+
+function updateRow(item) {
+  const labels = {
+    pending: ["В очереди", "status-pending"],
+    processing: ["Обработка…", "status-processing"],
+    done: ["Готово", "status-done"],
+    error: ["Ошибка", "status-error"]
+  };
+  const [label, cls] = labels[item.status] || labels.pending;
+  const statusTd = item.els.status;
+  statusTd.textContent = "";
+  const pill = document.createElement("span");
+  pill.className = "status-pill " + cls;
+  pill.textContent = label;
+  statusTd.appendChild(pill);
+  if (item.error) {
+    const err = document.createElement("span");
+    err.className = "file-error";
+    err.textContent = item.error;
+    statusTd.appendChild(err);
+  } else if (item.note) {
+    const note = document.createElement("span");
+    note.className = "file-note";
+    note.textContent = item.note;
+    statusTd.appendChild(note);
   }
+
+  item.els.time.textContent = item.elapsed != null ? item.elapsed + " с" : "—";
+
+  renderProgress(item, item.status === "done" ? 100
+                    : item.status === "processing" ? item.pct : 0);
+
+  const actionTd = item.els.action;
+  actionTd.textContent = "";
+  const btn = document.createElement("button");
+  btn.className = "btn-row";
+  btn.type = "button";
+  if (item.status === "done" && item.downloadUrl) {
+    btn.classList.add("btn-row-dl");
+    btn.textContent = "Скачать";
+    btn.addEventListener("click", () => downloadFile(item.downloadUrl, item.downloadName));
+  } else {
+    btn.textContent = item.status === "processing" ? "Подождите" : "Скачать";
+    btn.disabled = true;
+  }
+  actionTd.appendChild(btn);
 }
 
-// ---------- обработка ----------
-$("btn").addEventListener("click", async () => {
-  const f = $("file").files[0];
-  if (!f) { setStatus("Выберите файл", "err"); return; }
+function updateSummary() {
+  const total = queue.length;
+  if (!total) { $("summary").textContent = ""; return; }
+  const done = queue.filter(q => q.status === "done").length;
+  const errors = queue.filter(q => q.status === "error").length;
+  const active = queue.filter(q => q.status === "processing").length;
+  let text = "Готово " + done + " из " + total;
+  if (errors) text += ", с ошибкой: " + errors;
+  if (active) text += " — идёт обработка…";
+  $("summary").textContent = text;
+}
+
+function updateButton() {
+  $("btn").disabled = processing || !queue.some(q => q.status === "pending");
+}
+
+// ---------- обработка: строго по одному файлу ----------
+$("btn").addEventListener("click", processAll);
+
+async function processAll() {
+  if (processing) return;
   if (!creds) { logout(); return; }
+  if (!queue.some(q => q.status === "pending")) {
+    setStatus("Добавьте файлы для обработки", "err");
+    return;
+  }
 
-  const fd = new FormData();
-  fd.append("file", f);
-
+  processing = true;
   $("btn").disabled = true;
-  $("result").classList.add("hidden");
-  setStatus("", "");
-  startProgress();
+  setStatus("Файлы обрабатываются, ожидайте....", "");
 
+  for (const item of queue) {
+    if (!creds) break;
+    if (item.status !== "pending") continue;
+    await processOne(item);
+    updateSummary();
+  }
+
+  processing = false;
+  updateButton();
+  updateSummary();
+  if (!creds) return;
+  const errors = queue.filter(q => q.status === "error").length;
+  setStatus(errors ? "Обработка завершена, ошибок: " + errors
+                   : "Все файлы готовы. Скачивайте по одному.",
+            errors ? "err" : "ok");
+}
+
+async function processOne(item) {
+  item.status = "processing";
+  item.error = "";
+  item.note = "";
+  item.elapsed = null;
+  updateRow(item);
+  updateSummary();
+
+  if (item.timer) clearInterval(item.timer);
+  item.timer = setInterval(() => {
+    if (item.pct < 95) {
+      const step = Math.max(1, Math.round((95 - item.pct) * 0.08));
+      renderProgress(item, Math.min(95, item.pct + step));
+    }
+  }, 400);
+
+  const started = performance.now();
   try {
+    const fd = new FormData();
+    fd.append("file", item.file);
     const r = await fetch("/api/process", { method: "POST", headers: headers(), body: fd });
     let d = {};
     try { d = await r.json(); } catch {}
-    if (r.status === 401) { logout(); $("loginMsg").textContent = "Сессия истекла, войдите снова"; return; }
-    if (!r.ok) throw new Error(d.detail || "Не удалось обработать файл");
-    finishProgress(true);
-    renderResult(d);
-    setStatus("Файл готов к скачиванию", "ok");
-  } catch (e) {
-    finishProgress(false);
-    setStatus("Ошибка: " + e.message, "err");
-  } finally {
-    $("btn").disabled = false;
-  }
-});
-
-function renderResult(d) {
-  $("result").classList.remove("hidden");
-
-  const a = $("dl");
-  a.href = d.download_url;
-  a.download = d.download_name || "";
-  a.onclick = null;
-  a.addEventListener("click", async e => {
-    e.preventDefault();
-    try {
-      const r = await fetch(d.download_url, { headers: headers() });
-      if (r.status === 401) { logout(); $("loginMsg").textContent = "Сессия истекла"; return; }
-      if (!r.ok) throw new Error("Не удалось скачать файл");
-      const blob = await r.blob();
-      const url = URL.createObjectURL(blob);
-      const tmp = document.createElement("a");
-      tmp.href = url;
-      tmp.download = d.download_name || "masked";
-      document.body.appendChild(tmp);
-      tmp.click();
-      tmp.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 2000);
-    } catch (err) {
-      setStatus("Ошибка скачивания: " + err.message, "err");
+    if (r.status === 401) {
+      logout();
+      $("loginMsg").textContent = "Сессия истекла, войдите снова";
+      return;
     }
-  });
+    if (!r.ok) throw new Error(d.detail || "Не удалось обработать файл");
+    item.status = "done";
+    item.downloadUrl = d.download_url;
+    item.downloadName = d.download_name || ("masked_" + item.file.name);
+    item.elapsed = d.elapsed != null ? d.elapsed
+                                     : Math.round((performance.now() - started) / 100) / 10;
+    item.note = d.warning || (d.llm_error
+      ? (d.llm_error === "disabled" ? "LLM отключена — использованы только правила"
+                                    : "LLM недоступна — использованы только правила")
+      : "");
+    renderPreview(d, item.file.name);
+  } catch (e) {
+    item.status = "error";
+    item.error = e.message;
+  }
+  if (item.timer) { clearInterval(item.timer); item.timer = null; }
+  item.pct = item.status === "done" ? 100 : 0;
+  updateRow(item);
+}
 
-  // предпросмотр — по кнопке, чтобы не засорять экран
+async function downloadFile(url, name) {
+  try {
+    const r = await fetch(url, { headers: headers() });
+    if (r.status === 401) { logout(); $("loginMsg").textContent = "Сессия истекла"; return; }
+    if (!r.ok) throw new Error("Не удалось скачать файл");
+    const blob = await r.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objUrl;
+    a.download = name || "masked";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 2000);
+  } catch (e) {
+    setStatus("Ошибка скачивания: " + e.message, "err");
+  }
+}
+
+// ---------- предпросмотр последнего готового файла ----------
+function renderPreview(d, filename) {
   const body = $("previewBody");
   const toggle = $("previewToggle");
   body.textContent = "";
   body.classList.add("hidden");
-  toggle.textContent = "Показать предпросмотр";
+  toggle.classList.remove("hidden");
+  toggle.textContent = "Показать предпросмотр" + (filename ? ": " + filename : "");
 
   if (d.preview_type === "excel" && Array.isArray(d.preview) && d.preview.length) {
     const t = document.createElement("table");
@@ -409,7 +587,9 @@ function renderResult(d) {
 
   toggle.onclick = () => {
     const hidden = body.classList.toggle("hidden");
-    toggle.textContent = hidden ? "Показать предпросмотр" : "Скрыть предпросмотр";
+    toggle.textContent = hidden
+      ? "Показать предпросмотр" + (filename ? ": " + filename : "")
+      : "Скрыть предпросмотр";
   };
 }
 

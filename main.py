@@ -87,6 +87,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("activity")
 
+# LM Studio обрабатывает один документ за раз: очередь из интерфейса отправляет
+# файлы последовательно, а этот замок страхует от параллельных запросов из
+# нескольких вкладок/клиентов.
+PROCESS_LOCK = threading.Lock()
+
 
 def ensure_settings() -> None:
     if not SETTINGS_FILE.exists():
@@ -159,6 +164,155 @@ POSITIONS = ["Генеральный директор", "Директор", "Г�
              "Менеджер", "Инженер", "Юрист", "Начальник отдела", "Руководитель проекта",
              "Заместитель директора", "Специалист"]
 
+# Юридические формы организаций. Полные формы встречаются в договорах чаще, чем
+# аббревиатуры, поэтому их нужно распознавать отдельно от ООО/АО/ПАО.
+LEGAL_FORMS = (
+    r"Федеральное\s+государственное\s+унитарное\s+предприятие|"
+    r"Федеральное\s+государственное\s+бюджетное\s+учреждение|"
+    r"Федеральное\s+государственное\s+казенное\s+учреждение|"
+    r"Федеральное\s+государственное\s+автономное\s+учреждение|"
+    r"Общество\s+с\s+ограниченной\s+ответственностью|"
+    r"Общество\s+с\s+дополнительной\s+ответственностью|"
+    r"Публичное\s+акционерное\s+общество|"
+    r"Непубличное\s+акционерное\s+общество|"
+    r"Закрытое\s+акционерное\s+общество|"
+    r"Открытое\s+акционерное\s+общество|"
+    r"Акционерное\s+общество|"
+    r"Индивидуальный\s+предприниматель|"
+    r"Государственное\s+унитарное\s+предприятие|"
+    r"Муниципальное\s+унитарное\s+предприятие|"
+    r"Унитарное\s+предприятие|"
+    r"Автономная\s+некоммерческая\s+организация|"
+    r"Некоммерческая\s+организация|"
+    r"Государственная\s+корпорация|"
+    r"Государственное\s+бюджетное\s+учреждение|"
+    r"Государственное\s+автономное\s+учреждение|"
+    r"Муниципальное\s+бюджетное\s+учреждение|"
+    r"Казенное\s+учреждение|"
+    r"Бюджетное\s+учреждение|"
+    r"Автономное\s+учреждение|"
+    r"Потребительский\s+кооператив|"
+    r"Производственный\s+кооператив"
+)
+ORG_PREFIX_PATTERN = (
+    r"ООО|ОАО|ЗАО|ПАО|АО|ИП|ФГУП|ФГБУ|ФГКУ|ГУП|МУП|ГБУ|МБУ|ГАУ|АНО|НКО|"
+    r"Фонд|Министерство|Департамент|Управление|Компания"
+)
+ORG_FORM_PATTERN = rf"(?:{LEGAL_FORMS}|{ORG_PREFIX_PATTERN})"
+# Форма в начале значения: «ООО «...»» -> («ООО», ««...»»).
+ORG_FORM_RE = re.compile(
+    rf"^\s*({LEGAL_FORMS}|{ORG_PREFIX_PATTERN})(?![А-Яа-яЁёA-Za-z])\s*", re.I)
+ORG_ANY_RE = re.compile(
+    rf"(?<![А-Яа-яЁёA-Za-z])(?:{LEGAL_FORMS}|{ORG_PREFIX_PATTERN})"
+    rf"(?![А-Яа-яЁёA-Za-z])", re.I)
+QUOTED_NAME = r"[«\"][^»\"\n]{2,120}[»\"]"
+# После названия организации часто без запятой идут реквизиты; их подписи
+# не должны попадать в само название.
+ORG_NAME_STOP = (
+    r"(?i:(?:ИНН|КПП|ОГРН|ОГРНИП|БИК|СНИЛС|Адрес|Телефон|Факс|Email|E-mail|"
+    r"Р/с|К/с|Банк|Сумма|Итого|Всего|Дата|Срок|Подпись|Директор|Получатель|"
+    r"Плательщик)(?![А-Яа-яЁёA-Za-z]))")
+CAP_NAME = (rf"(?!{ORG_NAME_STOP})[А-ЯЁA-Z][\w\-]*"
+            rf"(?:\s+(?!{ORG_NAME_STOP})[А-ЯЁA-Z][\w\-]*){{0,7}}")
+ORG_VALUE_PATTERN = (
+    rf"(?i:{LEGAL_FORMS}|{ORG_PREFIX_PATTERN})\s*(?:{QUOTED_NAME}|{CAP_NAME})")
+BANK_VALUE_PATTERN = (
+    rf"(?:(?:(?:(?i:{ORG_PREFIX_PATTERN}))\s+(?:(?i:Банк))\s+|(?i:Банк)\s+)"
+    rf"(?:{QUOTED_NAME}|{CAP_NAME}))")
+BANK_AFTER_LABEL_PATTERN = (
+    rf"(?:(?:(?:(?i:{ORG_PREFIX_PATTERN}))\s+)?(?:(?:(?i:Банк))\s+)?"
+    rf"(?:{QUOTED_NAME}|{CAP_NAME}))")
+BANK_ANY_RE = re.compile(rf"(?<![А-Яа-яЁёA-Za-z])Банк(?![А-Яа-яЁёA-Za-z])", re.I)
+
+# Стороны договора: после этих подписей идёт наименование организации/ИП.
+PARTY_LABELS = (
+    r"Поставщик|Покупатель|Заказчик|Исполнитель|Подрядчик|Субподрядчик|Продавец|"
+    r"Арендодатель|Арендатор|Лицензиар|Лицензиат|Кредитор|За[её]мщик|Гарант|"
+    r"Принципал|Агент|Комитент|Комиссионер|Доверитель|Поверенный|Цедент|"
+    r"Цессионарий|Плательщик|Получатель|Грузоотправитель|Грузополучатель|"
+    r"Перевозчик|Экспедитор|Хранитель|Поклажедатель|Франчайзер|Франчайзи|"
+    r"Сторона\s*(?:№\s*)?[12]"
+)
+AMOUNT_LABELS = (
+    r"Сумм[аы](?:\s+(?:договора|платежа|платежей|оплаты|аванса))?|Цен[аы](?:\s+договора)?|"
+    r"Стоимост[ьи](?:\s+(?:договора|работ|услуг|товаров))?|Итого(?:\s+без\s+НДС)?|"
+    r"Всего(?:\s+без\s+НДС)?|Аванс|Оплата|Плат[её]ж|Вознаграждение|Штраф|Пеня|"
+    r"Неустойка|Задаток|Депозит"
+)
+AMOUNT_VALUE_PATTERN = (
+    r"((?:(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d+)(?:[.,]\d{1,2})?"
+    r"(?:\s*(?:руб\.?|рублей|р\.|₽|USD|EUR|€|долл\.?|евро))?"
+    r"(?:\s*\([^)\n]{1,200}\))?"
+    r"(?:\s*(?:руб\.?|рублей|р\.|₽|USD|EUR|€|долл\.?|евро))?"
+    r"(?:\s+\d{1,2}\s*коп\w*)?)"
+    r"|(?!(?:в|во|за|без|до|от|на|из|с|по|при|под|над|для|со)\s)"
+    r"(?:(?:[А-Яа-яЁё]+\s+){1,8}(?:руб\w*)(?:\s+\d{1,2}\s*коп\w*)?)"
+    r"|(?!(?:в|во|за|без|до|от|на|из|с|по|при|под|над|для|со)\s)"
+    r"(?:(?:[А-Яа-яЁё]+\s+){1,8}(?:коп\w*|долл\w*|евро|₽|USD|EUR)))"
+)
+TERM_LABELS = (
+    r"Сроки?(?:\s+(?:поставки|оплаты|выполнения(?:\s+работ)?|оказания\s+услуг|"
+    r"действия(?:\s+договора)?|годности|гарантии))?|Гарантийн\w*\s+срок|Гаранти[яи]|"
+    r"Периоды?(?:\s+(?:поставки|гарантии|действия))?|Срок\s+годности"
+)
+_MONTH_WORD = (r"(?:январ\w*|феврал\w*|март\w*|апрел\w*|ма[йя]\w*|июн\w*|июл\w*|"
+               r"август\w*|сентябр\w*|октябр\w*|ноябр\w*|декабр\w*)")
+TERM_VALUE_PATTERN = (
+    rf"((?:\d{{1,2}}[./-]\d{{1,2}}[./-]\d{{2,4}}|\d{{4}}[./-]\d{{2}}[./-]\d{{2}})|"
+    rf"(?:\d{{1,2}}\s+{_MONTH_WORD}\s+\d{{4}}(?:\s*г\.?)?)|"
+    r"(?:(?:в\s+течение|не\s+позднее|не\s+менее|не\s+более|составляет)\s+)?"
+    r"(?:\d+\s*(?:\([^)\n]{1,200}\)\s*)?(?:календарн\w*\s+)?"
+    r"(?:дн\w*|недел\w*|месяц\w*|лет|год\w*))|"
+    r"(?:(?:[А-Яа-яЁё]+\s+){1,5}(?:календарн\w*\s+)?(?:дн\w*|недел\w*|месяц\w*|лет|год\w*)))"
+)
+ITEM_LABELS = (
+    r"Товар(?:ы|а|ов)?|Услуг[аи]|Работ[аы]|"
+    r"Наименование(?:\s+(?:товара|товаров|работ|работы|услуг|услуги))?|"
+    r"Предмет\s+договора|Номенклатура"
+)
+# Значение товара/работы/услуги: до запятой/точки с запятой или до следующей
+# подписи колонки, чтобы не съесть соседние ячейки таблицы.
+_ITEM_COLUMN_STOP = (
+    r"(?i:(?:Цена|Сумма|Стоимость|Количество|Кол-во|Ед|Единица|Итого|Всего|"
+    r"НДС|Код|Номер|Ставка|Скидка|Банк\w*|Организац\w*|Документ\w*|Показател\w*|"
+    r"Клиент\w*|Поставщик\w*|Покупател\w*|Получател\w*|Плательщик\w*|Договор\w*|"
+    r"Счет|Счёт)(?![А-Яа-яЁёA-Za-z]))")
+_ITEM_TOKEN = rf"(?!{_ITEM_COLUMN_STOP})[А-Яа-яЁёA-Za-z][\w\-]*"
+_ITEM_SEGMENT = rf"(?:{QUOTED_NAME}|{_ITEM_TOKEN}(?:\s+{_ITEM_TOKEN}){{0,7}})"
+# Товары/услуги часто перечислены через запятую или точку с запятой — прячем
+# весь список, иначе соседние позиции (в том числе со строчной буквы) остаются.
+ITEM_VALUE_PATTERN = rf"{_ITEM_SEGMENT}(?:\s*[,;]\s*{_ITEM_SEGMENT}){{0,5}}"
+
+
+# Числительные прописью: их тоже надо прятать, иначе сумма/срок остаются
+# читаемыми, даже когда цифры заменены.
+_NUM_WORD_RE = re.compile(
+    r"(?i)\b(?:"
+    r"один|одна|одно|одного|одной|одному|одним|одном|одну|"
+    r"два|две|двух|двум|двумя|три|трех|трёх|трем|трём|тремя|"
+    r"четыре|четырех|четырёх|четырем|четырём|четырьмя|"
+    r"пять|пяти|пятью|шесть|шести|шестью|семь|семи|семью|"
+    r"восемь|восьми|восемью|девять|девяти|девятью|"
+    r"десять|десяти|десятью|одиннадцать|одиннадцати|двенадцать|двенадцати|"
+    r"тринадцать|тринадцати|четырнадцать|четырнадцати|пятнадцать|пятнадцати|"
+    r"шестнадцать|шестнадцати|семнадцать|семнадцати|восемнадцать|восемнадцати|"
+    r"девятнадцать|девятнадцати|двадцать|двадцати|двадцатью|"
+    r"тридцать|тридцати|тридцатью|сорок|сорока|"
+    r"пятьдесят|пятидесяти|пятьюдесятью|шестьдесят|шестидесяти|шестьюдесятью|"
+    r"семьдесят|семидесяти|семьюдесятью|восемьдесят|восьмидесяти|восемьюдесятью|"
+    r"девяносто|девяноста|сто|ста|двести|двухсот|двумстам|двумястами|двухстах|"
+    r"триста|трехсот|трёхсот|тремстам|тремястами|четыреста|четырехсот|четырёхсот|"
+    r"четыремстам|четырьмястами|пятьсот|пятисот|пятистам|пятьюстами|"
+    r"шестьсот|шестисот|шестистам|шестьюстами|семьсот|семисот|семистам|"
+    r"семьюстами|восемьсот|восьмисот|восьмистам|восемьюстами|девятьсот|"
+    r"девятисот|девятистам|девятьюстами|"
+    r"тысяча|тысячи|тысяче|тысячу|тысячей|тысяч|тысячам|тысячами|тысячах|"
+    r"миллион|миллиона|миллиону|миллионом|миллионе|миллионы|миллионов|"
+    r"миллионам|миллионами|миллионах|миллиард|миллиарда|миллиарду|миллиардом|"
+    r"миллиарде|миллиарды|миллиардов|миллиардам|миллиардами|миллиардах"
+    r")\b"
+)
+
 # Служебные слова, которые сами по себе не являются ПДн.
 STOP_VALUES = {
     "договор", "акт", "счёт", "счет", "итого", "всего", "приложение", "сторона",
@@ -171,6 +325,21 @@ STOP_VALUES = {
     "ано", "нко", "фонд", "министерство", "департамент", "управление", "компания",
     "г.", "ул.", "д.", "кв.", "обл.", "стр.", "корп.", "пр-т", "наб.", "ш.",
     "место", "жительства", "нахождения", "регистрации", "почтовый",
+    # Роли сторон договора — это подписи полей, а не названия организаций.
+    "поставщик", "покупатель", "заказчик", "исполнитель", "подрядчик",
+    "субподрядчик", "продавец", "арендодатель", "арендатор", "лицензиар",
+    "лицензиат", "кредитор", "заёмщик", "заемщик", "гарант", "принципал",
+    "агент", "комитент", "комиссионер", "доверитель", "поверенный", "цедент",
+    "цессионарий", "плательщик", "получатель", "грузоотправитель",
+    "грузополучатель", "перевозчик", "экспедитор", "хранитель",
+    "поклажедатель", "франчайзер", "франчайзи", "сторона",
+    # Общие слова юридических форм без названия организации.
+    "общество", "ограниченной", "ответственностью", "дополнительной",
+    "акционерное", "публичное", "непубличное", "закрытое", "открытое",
+    "индивидуальный", "предприниматель", "унитарное", "предприятие",
+    "автономная", "некоммерческая", "государственное", "муниципальное",
+    "федеральное", "бюджетное", "казенное", "автономное", "учреждение",
+    "корпорация", "кооператив", "потребительский", "производственный",
 }
 
 # Слова-заголовки таблиц/анкет: три подряд таких слова — не ФИО и не организация.
@@ -207,6 +376,20 @@ HEADER_WORDS = {
     "показатель", "свойство", "направление", "категория", "группа", "класс",
     "подразделение", "согласование", "утверждение", "описание",
     "того", "ндс", "скидка", "надбавка", "остаток", "расход", "приход",
+    # Стороны договора и юридические формы — подписи полей/общие термины.
+    "поставщик", "покупатель", "заказчик", "исполнитель", "подрядчик",
+    "субподрядчик", "продавец", "арендодатель", "арендатор", "лицензиар",
+    "лицензиат", "кредитор", "заёмщик", "заемщик", "гарант", "принципал",
+    "агент", "комитент", "комиссионер", "доверитель", "поверенный", "цедент",
+    "цессионарий", "плательщик", "получатель", "грузоотправитель",
+    "грузополучатель", "перевозчик", "экспедитор", "хранитель",
+    "поклажедатель", "франчайзер", "франчайзи", "сторона",
+    "общество", "ограниченной", "ответственностью", "дополнительной",
+    "акционерное", "публичное", "непубличное", "закрытое", "открытое",
+    "индивидуальный", "предприниматель", "унитарное", "предприятие",
+    "автономная", "некоммерческая", "государственное", "муниципальное",
+    "федеральное", "бюджетное", "казенное", "автономное", "учреждение",
+    "корпорация", "кооператив", "потребительский", "производственный",
 }
 
 # Основы служебных названий: слово считается заголовком, если начинается с
@@ -230,7 +413,10 @@ FIELD_FILLERS = {
 
 
 def _is_header_like(value: str) -> bool:
-    words = re.findall(r"[А-Яа-яЁёA-Za-z]+", str(value or "").lower())
+    s = str(value or "")
+    if re.search(r"\d", s):
+        return False
+    words = re.findall(r"[А-Яа-яЁёA-Za-z]+", s.lower())
     return bool(words) and all(w in HEADER_WORDS for w in words)
 
 
@@ -258,6 +444,13 @@ def _is_field_name(value: str) -> bool:
 
 _HEADER_SENSITIVE_KINDS = {"fio", "fio_initials", "fio_lat", "signature"}
 
+# Для этих типов значение — число/дата/сумма, поэтому проверки «похоже на
+# заголовок таблицы» неприменимы, а короткие совпадения (например, «1 год»)
+# тоже нужно маскировать.
+_DIGIT_KINDS = {"amount", "term", "number", "date", "birthdate", "index",
+                "house", "apartment", "inn", "ogrn", "ogrn_bare", "kpp",
+                "bik", "rs", "snils", "passport"}
+
 
 def _has_header_word(value: str) -> bool:
     words = re.findall(r"[А-Яа-яЁёA-Za-z]+", str(value or "").lower())
@@ -270,6 +463,7 @@ VALID_KINDS = {
     "house", "apartment", "index", "position", "signature", "birthdate",
     "email", "phone", "passport", "snils", "inn", "ogrn", "ogrn_bare", "kpp",
     "bik", "rs", "date", "number", "extra",
+    "bank", "amount", "term", "item",
 }
 
 KIND_ALIASES = {
@@ -307,6 +501,16 @@ KIND_ALIASES = {
     "огрнип": "ogrn", "кпп": "kpp", "kpp": "kpp", "бик": "bik", "bik": "bik",
     "расчётный_счёт": "rs", "расчетный_счет": "rs", "р/с": "rs", "account": "rs",
     "дата": "date", "date": "date", "номер": "number", "number": "number",
+    "банк": "bank", "bank_name": "bank", "bank": "bank", "название_банка": "bank",
+    "сумма": "amount", "amount": "amount", "payment": "amount",
+    "payment_amount": "amount", "цена": "amount", "price": "amount",
+    "стоимость": "amount", "cost": "amount", "total": "amount",
+    "срок": "term", "term": "term", "deadline": "term",
+    "delivery_term": "term", "period": "term", "гарантия": "term",
+    "гарантийный_срок": "term", "guarantee": "term",
+    "товар": "item", "goods": "item", "product": "item",
+    "услуга": "item", "service": "item", "работа": "item", "work": "item",
+    "item": "item", "наименование_товара": "item",
     "other": "extra", "другое": "extra", "extra": "extra",
 }
 
@@ -338,6 +542,15 @@ def _clean_value(v: Any) -> str:
     v = re.sub(r"\s+", " ", v).strip()
     # Метку («ИНН», «Адрес», «ФИО» и т.п.) не заменяем — оставляем в документе.
     return _LABEL_PREFIX_RE.sub("", v, count=1).strip()
+
+
+def _split_org(value: str) -> Tuple[str, str]:
+    """Делит название на юридическую форму и остаток: «ООО «...»» -> («ООО», ««...»»)."""
+    v = str(value or "").strip()
+    m = ORG_FORM_RE.match(v)
+    if not m:
+        return "", v
+    return m.group(1).strip(), v[m.end():].strip()
 
 
 def _norm_char(ch: str) -> str:
@@ -405,6 +618,11 @@ def _is_bad_value(v: str) -> bool:
         return True
     if not re.search(r"[A-Za-zА-Яа-яЁё0-9]", v):
         return True
+    # Модель иногда возвращает всю фразу преамбулы договора. Заменять её целиком
+    # нельзя: вместе с названием исчезнут слова «именуемое в дальнейшем…».
+    if re.search(r"(?i)именуем|в\s+дальнейшем|в\s+лице|действующ(?:ий|его|ая|ее)|"
+                 r"с\s+одной\s+стороны|с\s+другой\s+стороны", v):
+        return True
     return (v.lower() in STOP_VALUES or _is_header_like(v)
             or _is_field_name(v))
 
@@ -431,12 +649,12 @@ PLAIN_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("ogrn", re.compile(r"(?<!\d)(?:\d{13}|\d{15})(?!\d)")),
     ("bik", re.compile(r"(?<!\d)\d{9}(?!\d)")),
     ("rs", re.compile(r"(?<!\d)\d{20}(?!\d)")),
-    # --- Организации: только префикс + до 6 слов названия, без захвата всей строки ---
+    # --- Организации: аббревиатура/полная юридическая форма + название ---
     ("org", re.compile(
-        r"(?<![А-Яа-яЁёA-Za-z])"
-        r"(?i:ООО|ОАО|ЗАО|ПАО|АО|ИП|ФГУП|ГУП|МУП|ГБУ|ГАУ|АНО|НКО|Фонд|"
-        r"Министерство|Департамент|Управление|Компания)\s*[«\"]?"
-        r"[А-ЯЁA-Z][\w\-]*(?:\s+[А-ЯЁA-Z][\w\-]*){0,5}[»\"]?")),
+        rf"(?<![А-Яа-яЁёA-Za-z]){ORG_VALUE_PATTERN}")),
+    # --- Наименование банка (реквизиты): «ПАО Банк «...»», «Банк ...» ---
+    ("bank", re.compile(
+        rf"(?<![А-Яа-яЁёA-Za-z]){BANK_VALUE_PATTERN}")),
     # --- ФИО: обычный регистр, ВЕРХНИЙ РЕГИСТР, смешанный, инициалы ---
     ("fio", re.compile(
         r"(?<![А-Яа-яЁёA-Za-z])"
@@ -466,6 +684,8 @@ PLAIN_PATTERNS: List[Tuple[str, re.Pattern]] = [
         r"apt\.|apartment|suite|bldg\.|building|city|town)\s+[^\n,;]{1,60}"
         r"(?:,\s*[^\n,;]{1,60}){0,3}", re.I)),
     ("date", re.compile(r"(?<!\d)(?:\d{2}[./-]\d{2}[./-]\d{4}|\d{4}[./-]\d{2}[./-]\d{2})(?!\d)")),
+    ("date", re.compile(
+        rf"(?<!\d)\d{{1,2}}\s+{_MONTH_WORD}\s+\d{{4}}(?:\s*г\.?)?(?!\d)", re.I)),
     ("number", re.compile(r"(?<![\d.,])-?(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d+)(?:[.,]\d+)?(?![\d])")),
 ]
 
@@ -495,10 +715,21 @@ GROUP_PATTERNS: List[Tuple[str, re.Pattern, int]] = [
         r"(?:Name|Full\s*name|Director|Owner|Employee|Customer|Borrower|Client|"
         r"Representative|Signatory)\s*[:\-]?\s*([A-Z][A-Za-z.\t -]{2,80})", re.I), 1),
     ("org", re.compile(
-        r"(?:Организация|Наименование|Работодатель|Компания|Страхователь|Продавец|"
-        r"Покупатель|Исполнитель|Заказчик)\s*[:\-]?\s*"
-        r"((?:ООО|ОАО|ЗАО|ПАО|АО|ИП|ФГУП|ГУП|МУП|ГБУ|ГАУ|АНО|НКО)?\s*[«\"]?"
-        r"[А-ЯЁA-Z][\w\-]*(?:\s+[А-ЯЁA-Z][\w\-]*){0,5}[»\"]?)"), 1),
+        rf"(?:{PARTY_LABELS}|Организация|Наименование|Работодатель|Компания|"
+        rf"Страхователь|Продавец|Покупатель|Исполнитель|Заказчик|Поставщик|"
+        rf"Подрядчик|Арендодатель|Арендатор|Лицензиар|Лицензиат|Кредитор|"
+        rf"За[её]мщик|Гарант|Принципал|Агент|Плательщик|Получатель|"
+        rf"Грузоотправитель|Грузополучатель|Перевозчик|Экспедитор)\s*[:\-]?\s*"
+        rf"({ORG_VALUE_PATTERN})", re.I), 1),
+    ("bank", re.compile(
+        rf"(?:Банк(?:\s+(?:получателя|плательщика))?|Наименование\s+банка|"
+        rf"Банк-эмитент)\s*[:\-]?\s*({BANK_AFTER_LABEL_PATTERN})", re.I), 1),
+    ("amount", re.compile(
+        rf"(?:{AMOUNT_LABELS})\s*[:\-]?\s*{AMOUNT_VALUE_PATTERN}", re.I), 1),
+    ("term", re.compile(
+        rf"(?:{TERM_LABELS})\s*[:\-]?\s*{TERM_VALUE_PATTERN}", re.I), 1),
+    ("item", re.compile(
+        rf"(?:{ITEM_LABELS})\s*[:\-]?\s*({ITEM_VALUE_PATTERN})", re.I), 1),
     ("address", re.compile(
         r"(?:Адрес|Место жительства|Место нахождения|Почтовый адрес|Место регистрации|"
         r"Address)\s*[:\-]?\s*([^\n;]{5,150})", re.I), 1),
@@ -527,13 +758,15 @@ PRIORITY = {
     "date": 8, "birthdate": 8,
     "fio": 7, "fio_initials": 7, "fio_lat": 7, "surname": 7, "name": 7, "patronymic": 7,
     "org": 7, "org_name": 7, "abbr": 7,
+    "bank": 9, "amount": 8, "term": 8, "item": 6,
     "address": 7, "address_lat": 7, "city": 7, "street": 7, "house": 7,
     "apartment": 7, "index": 7, "position": 7, "signature": 7,
     "number": 1, "extra": 5,
 }
 EXTRA_PRIORITY = 11  # целые сущности от LLM важнее регулярных догадок
 COMPONENT_KINDS = {"surname", "name", "patronymic", "fio_initials", "org_name",
-                   "city", "street", "house", "apartment", "index", "abbr", "position"}
+                   "city", "street", "house", "apartment", "index", "abbr", "position",
+                   "amount", "term", "item"}
 
 
 def _mix_letters(text: str, rate: float = 0.08) -> str:
@@ -564,11 +797,12 @@ def _inn_checksum(digits: str) -> str:
     if len(digits) == 9:
         weights = [2, 4, 10, 3, 5, 9, 4, 6, 8]
         return str(sum(int(d) * w for d, w in zip(digits, weights)) % 11 % 10)
-    if len(digits) == 11:
+    if len(digits) == 10:
+        # 12-значный ИНН: две контрольные цифры от первых 10 цифр.
         w1 = [7, 2, 4, 10, 3, 5, 9, 4, 6, 8]
         w2 = [3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8]
         c1 = sum(int(d) * w for d, w in zip(digits, w1)) % 11 % 10
-        c2 = sum(int(d) * w for d, w in zip(digits, w2)) % 11 % 10
+        c2 = sum(int(d) * w for d, w in zip(digits + str(c1), w2)) % 11 % 10
         return f"{c1}{c2}"
     return ""
 
@@ -618,8 +852,22 @@ def _infer_kind(v: str) -> str:
         return "bik"
     if re.fullmatch(r"\d{20}", s):
         return "rs"
-    if re.search(r"(?i:ООО|ОАО|ЗАО|ПАО|АО|ИП|ФГУП|ГУП|МУП|ГБУ|ГАУ|АНО|НКО|"
-                 r"Фонд|Министерство|Департамент|Управление|Компания)", s):
+    if BANK_ANY_RE.search(s):
+        return "bank"
+    if re.search(r"\d", s) and re.search(
+            r"(?i)(?:сумм|цен[аы]|стоимост|итого|всего|аванс|оплат|плат[её]ж|"
+            r"штраф|пен[яи]|неустойк|вознагражд|депозит|задаток)", s):
+        return "amount"
+    if re.search(r"\d", s) and re.search(
+            r"(?i)(?:руб|₽|долл|евро|USD|EUR|рублей)", s):
+        return "amount"
+    if re.search(r"\d", s) and re.search(
+            r"(?i)(?:срок|гаранти|период|поставк|оплат)", s):
+        return "term"
+    if re.search(r"(?i)\d+\s*(?:календарн\w*\s+)?"
+                 r"(?:дн\w*|недел\w*|месяц\w*|лет|год\w*)", s):
+        return "term"
+    if ORG_ANY_RE.search(s):
         return "org"
     if re.search(r"(?i:г\.|город|ул\.|улица|д\.|дом|кв\.|квартира|обл\.|область|"
                  r"пр-т|проспект|наб\.|ш\.|шоссе|мкр\.|пос\.|с\.|респ\.)", s):
@@ -655,11 +903,15 @@ class Masker:
     def __init__(self):
         self.fake = Faker("ru_RU")
         self.cache: Dict[Tuple[str, str], str] = {}
+        self.item_seq = 0
 
     def get(self, kind: str, original: str) -> str:
         kind = _map_kind(kind) or _infer_kind(original)
         original = str(original or "")
         base = self._component(kind, original)
+        if kind == "item":
+            # «Позиция 1» — нейтральный маркер, регистр исходного названия не копируем.
+            return base
         return _apply_case(base, original)
 
     def _component(self, kind: str, original: str) -> str:
@@ -697,14 +949,41 @@ class Masker:
         p = self._component("patronymic", "")
         return (f"{n[0]}.{p[0]}. {s}" if initials_first else f"{s} {n[0]}.{p[0]}.")
 
+    def _org_brand(self, rest: str) -> str:
+        """Единый фейковый бренд для организации и её короткого названия."""
+        inner = re.findall(r"[«\"]([^»\"]{2,120})[»\"]", rest or "")
+        brand = inner[0] if inner else (rest or "").strip(" «»\"'")
+        if brand:
+            return self._component("org_name", brand)
+        return f"{random.choice(ORG_NAMES)} {random.choice(ORG_SUFFIXES)}"
+
     def _gen_org(self, original: str) -> str:
-        m = re.match(r"^\s*([А-ЯA-Z]+)\s+", original)
-        prefix = m.group(1) if m and m.group(1).upper() in ORG_PREFIXES else ""
-        if prefix.upper() == "ИП":
-            rest = original[m.end():] if m else original
-            return "ИП " + self._component("fio", rest)
+        original = str(original or "").strip()
+        form, rest = _split_org(original)
+        if re.search(r"(?i)индивидуальн|(?:^|\s)ИП$", form):
+            person = rest if rest and re.search(r"[А-ЯЁA-Zа-яёa-z]", rest) else self.fake.name()
+            return f"{form} {self._component('fio', person)}".strip()
+        name = self._org_brand(rest)
+        plain = name.strip(" «»\"'“”")
+        if not form:
+            return f"«{plain}»"
+        if rest.startswith("«"):
+            return f"{form} «{plain}»"
+        if rest.startswith(('"', "“")):
+            return f'{form} "{plain}"'
+        return f"{form} {plain}"
+
+    def _gen_bank(self, original: str) -> str:
+        m = re.match(rf"(?i)^\s*((?:{ORG_PREFIX_PATTERN})\s+)?Банк\s*", original)
+        head = (m.group(1) or "") if m else ""
+        if not head:
+            m2 = re.match(rf"(?i)^\s*((?:{ORG_PREFIX_PATTERN})\s+)", original)
+            head = (m2.group(1) or "") if m2 else ""
         name = f"{random.choice(ORG_NAMES)} {random.choice(ORG_SUFFIXES)}"
-        return f"{prefix} «{name}»" if prefix else f"«{name}»"
+        word = "Банк " if re.search(r"(?i)(?:^|\s)банк(?:\s|$)", original) else ""
+        if "«" in original or '"' in original or "“" in original:
+            return f"{head}{word}«{name}»".strip()
+        return f"{head}{word}{name}".strip()
 
     def _street_name(self) -> str:
         """Название улицы без типа («ул.», «пр.», «алл.»), чтобы не было «ул. ул. ...»."""
@@ -716,7 +995,8 @@ class Masker:
     def _gen_address(self, original: str) -> str:
         marker = (r"(?i:г\.|город|ул\.|улица|пр-т|проспект|пер\.|переулок|наб\.|набережная|"
                   r"ш\.|шоссе|д\.|дом|кв\.|квартира|корп\.|корпус|стр\.|строение|обл\.|область|"
-                  r"респ\.|республика|п\.|пос\.|поселок|с\.|село|мкр\.|микрорайон)")
+                  r"респ\.|республика|п\.|пос\.|поселок|с\.|село|мкр\.|микрорайон|"
+                  r"офис|помещение|комната|кабинет)")
 
         def repl(m: re.Match) -> str:
             label = m.group(1)
@@ -728,13 +1008,13 @@ class Masker:
                 return f"{label} {self._street_name()}"
             if low in ("д", "дом", "корп", "корпус", "стр", "строение"):
                 return f"{label} {self.fake.building_number()}"
-            if low in ("кв", "квартира"):
+            if low in ("кв", "квартира", "офис", "помещение", "комната", "кабинет"):
                 return f"{label} {random.randint(1, 400)}"
             if low in ("обл", "область", "респ", "республика"):
                 return f"{label} {self.fake.region()}"
             return m.group(0)
 
-        out = re.sub(marker + r"\s+([^\s,;]+)", repl, original)
+        out = re.sub(f"({marker})" + r"\s+([^\s,;]+)", repl, original)
         if out == original:
             words = original.split()
             if len(words) >= 2:
@@ -743,14 +1023,84 @@ class Masker:
             return self.fake.city_name()
         return out
 
+    _NUM_TOKEN_RE = re.compile(
+        rf"\d{{1,2}}\s+{_MONTH_WORD}\s+\d{{4}}|"
+        r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{2}[./-]\d{2}|"
+        r"(?<![\d.,])(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d+)(?:[.,]\d{1,2})?(?![\d])",
+        re.I)
+    _TEXT_DATE_RE = re.compile(rf"(\d{{1,2}})\s+({_MONTH_WORD})\s+(\d{{4}})", re.I)
+
+    @staticmethod
+    def _plural_class(number: int) -> int:
+        """Класс склонения: 1 — «день», 2 — «дня», 0 — «дней»."""
+        n = abs(int(number)) % 100
+        if 11 <= n <= 14:
+            return 0
+        n %= 10
+        if n == 1:
+            return 1
+        if 2 <= n <= 4:
+            return 2
+        return 0
+
+    def _number_of_class(self, original: str, cls: int) -> str:
+        """Число с нужным склонением следующего слова (длина по возможности та же)."""
+        digits = re.sub(r"\D", "", original)
+        for _ in range(60):
+            fake = self._number(original)
+            d = re.sub(r"\D", "", fake)
+            if d and d != digits and self._plural_class(int(d)) == cls:
+                return fake
+        # Для однозначных чисел нужный класс иногда недостижим без смены длины.
+        length = max(2, len(digits))
+        for _ in range(100):
+            n = random.randint(10 ** (length - 1), 10 ** length - 1)
+            if self._plural_class(n) == cls:
+                return str(n)
+        return self._number(original)
+
+    def _replace_numbers(self, text: str, unit_aware: bool = False) -> str:
+        """Меняет все числа и даты в строке, сохраняя формат и разделители."""
+        def repl(m: re.Match) -> str:
+            s = m.group(0)
+            tm = self._TEXT_DATE_RE.fullmatch(s)
+            if tm:
+                return f"{random.randint(1, 28):02d} {tm.group(2)} {random.randint(2000, 2035)}"
+            if re.search(r"[./-]", s):
+                return self._gen("date", s)
+            if unit_aware and re.fullmatch(r"\d+", s):
+                unit = re.match(
+                    r"\s*(?:(?:календарн\w*\s+)?(?:дн\w*|недел\w*|месяц\w*|лет|год\w*)"
+                    r"|руб\w*|коп\w*|долл\w*|евро)",
+                    text[m.end():], re.I)
+                if unit:
+                    return self._number_of_class(s, self._plural_class(int(s)))
+            return self._number(s)
+        return self._NUM_TOKEN_RE.sub(repl, text)
+
+    @staticmethod
+    def _redact_word_numbers(text: str) -> str:
+        """Прячет суммы/сроки прописью в скобках: «(пятьсот тысяч)» -> «(сумма прописью)»."""
+        def repl(m: re.Match) -> str:
+            return "(сумма прописью)" if _NUM_WORD_RE.search(m.group(0)) else m.group(0)
+        return re.sub(r"\([^)\n]{1,200}\)", repl, text)
+
     def _gen(self, kind: str, original: str) -> str:
         kind = _map_kind(kind) or _infer_kind(original)
         if kind == "fio":
             toks = self._fio_parts(original)
             if len(toks) >= 3:
-                s = self._component("surname", toks[0])
-                n = self._component("name", toks[1])
-                p = self._component("patronymic", toks[2])
+                # Согласуем фейковые ФИО по полу: иначе имя, отчество и фамилия
+                # выглядят как ошибка и мешают читать обезличенный документ.
+                female = bool(re.search(r"(?i)(?:[вчш]на|[вчш]ны|[вчш]не|[вчш]ну)$", toks[2]))
+                if female:
+                    s = self.fake.last_name_female()
+                    n = self.fake.first_name_female()
+                    p = self.fake.middle_name_female()
+                else:
+                    s = self.fake.last_name_male()
+                    n = self.fake.first_name_male()
+                    p = self.fake.middle_name_male()
                 return f"{s} {n} {p}"
             if len(toks) == 2:
                 return f"{self._component('surname', toks[0])} {self._component('name', toks[1])}"
@@ -774,6 +1124,41 @@ class Masker:
             return self.fake.email()
         if kind == "org":
             return self._gen_org(original)
+        if kind == "bank":
+            return self._gen_bank(original)
+        if kind == "amount":
+            text = self._redact_word_numbers(original)
+            if _NUM_WORD_RE.search(text):
+                # Числительные прописью вне скобок уже не восстановить —
+                # ставим нейтральную пометку вместо всей суммы.
+                return "по договору"
+            if not re.search(r"\d", text):
+                return "по договору"
+            return self._replace_numbers(text, unit_aware=True)
+        if kind == "term":
+            if not re.search(r"\d", original):
+                # Срок/гарантия прописью без цифр: исходный текст не сохраняем.
+                return "по договору"
+            # «30 (тридцать) дней»: числительное прописью в скобках убираем,
+            # чтобы оно не выдавало исходный срок.
+            text = re.sub(r"\([^)\n]{1,200}\)",
+                          lambda m: "" if _NUM_WORD_RE.search(m.group(0)) else m.group(0),
+                          original)
+            text = self._replace_numbers(text, unit_aware=True)
+            if _NUM_WORD_RE.search(text):
+                text = _NUM_WORD_RE.sub("", text)
+            text = re.sub(r"\s{2,}", " ", text).strip(" ,;")
+            return text or "по договору"
+        if kind == "item":
+            # Наименования товаров/работ/услуг не угадываем: заранее неизвестно,
+            # что именно в документе. Ставим нейтральный обезличенный номер позиции.
+            self.item_seq += 1
+            base = f"Позиция {self.item_seq}"
+            if original.startswith("«"):
+                return f"«{base}»"
+            if original.startswith('"'):
+                return f'"{base}"'
+            return base
         if kind == "org_name":
             name = f"{random.choice(ORG_NAMES)} {random.choice(ORG_SUFFIXES)}"
             if original.startswith("«") or original.startswith('"'):
@@ -826,15 +1211,15 @@ class Masker:
                 return f"{num[:3]} {num[3:6]} {num[6:9]} {num[9:]}"
             return num
         if kind == "kpp":
-            letters = "АБВГДЕЖЗИКЛМНОПРСТУФХЦЧШЩЭЮЯ"
-            return _rand_digits(4, True) + "".join(random.choice(letters) for _ in range(2)) + _rand_digits(3)
+            return _rand_digits(4, True) + "".join(
+                random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(2)) + _rand_digits(3)
         if kind == "inn":
             n = len(re.sub(r"\D", "", original))
             if n == 10:
                 base = _rand_digits(9)
                 return base + _inn_checksum(base)
             if n == 12:
-                base = _rand_digits(11)
+                base = _rand_digits(10, leading_zero=False)
                 return base + _inn_checksum(base)
             return _rand_digits(n or 10)
         if kind in ("ogrn", "ogrn_bare"):
@@ -859,7 +1244,7 @@ class Masker:
             if m:
                 d = date_cls(1995, 1, 1) + timedelta(days=random.randint(0, 12000))
                 return d.strftime(f"%Y{m.group(2)}%m{m.group(2)}%d")
-            return self._number(original)
+            return self._replace_numbers(original)
         if kind == "number":
             return self._number(original)
         if kind in ("extra", "other", ""):
@@ -963,8 +1348,10 @@ def _add_candidate(cands: List[Tuple[int, int, str, str, int]], start: int, end:
     value = raw.strip()
     # Название колонки/строки шапки («Наименование Товаров Цена» часто склеивается
     # регуляркой в одно ФИО/организацию) — служебный текст, менять его нельзя.
-    if end - start >= 2 and not _is_header_like(value) and not _is_field_name(value):
-        # Заголовок таблицы, склеенный со значением («Фамилия Иванов Имя»),
+    if (end - start >= 2 or kind in _DIGIT_KINDS) and (
+            kind in _DIGIT_KINDS
+            or (not _is_header_like(value) and not _is_field_name(value))):
+        # Заголовок таблицы, склеенный со значением,
         # не должен превращаться в ФИО/организацию.
         if kind in _HEADER_SENSITIVE_KINDS and _has_header_word(value):
             return
@@ -1234,10 +1621,28 @@ LLM_SYSTEM = (
     "позволяют идентифицировать человека, организацию или объект, и верни их ДОСЛОВНО, "
     "символ в символ, как в тексте.\n"
     "Что искать: ФИО полностью и по частям (фамилия, имя, отчество, инициалы); названия "
-    "организаций (полные, краткие, аббревиатуры, бренды); должности и подписи; адреса "
-    "полностью и по частям (город, улица, дом, корпус, квартира, индекс); телефоны, email; "
-    "паспорт, СНИЛС, ИНН, ОГРН/ОГРНИП, КПП, БИК, счета; даты рождения; любые имена "
-    "собственные, названия и номера, по которым можно идентифицировать человека или компанию.\n"
+    "организаций (полные, краткие, аббревиатуры, бренды), в том числе «Общество с "
+    "ограниченной ответственностью ...», «Акционерное общество ...», «Публичное "
+    "акционерное общество ...», «Индивидуальный предприниматель ...»; должности и подписи; "
+    "адреса полностью и по частям (город, улица, дом, корпус, квартира, индекс); телефоны, "
+    "email; паспорт, СНИЛС, ИНН, ОГРН/ОГРНИП, КПП, БИК, расчётные и корреспондентские "
+    "счета; наименования банков; даты рождения.\n"
+    "Обязательно ищи стороны договора после подписей «Поставщик», «Покупатель», "
+    "«Заказчик», «Исполнитель», «Подрядчик», «Арендодатель», «Арендатор», «Продавец», "
+    "«Лицензиар», «Лицензиат», «Кредитор», «Заёмщик», «Гарант», «Плательщик», "
+    "«Получатель», «Сторона 1», «Сторона 2» и аналогичных — это названия организаций/ИП.\n"
+    "Где искать: стороны — в преамбуле (после «именуемое в дальнейшем») и в блоке "
+    "реквизитов; банк, счета и БИК — в реквизитах; суммы, цены, аванс, штрафы — в "
+    "разделе о цене, в таблицах и в назначении платежа; сроки и гарантии — в разделах "
+    "о сроках, поставке и гарантиях; товары, работы, услуги — в спецификации, смете, "
+    "перечне или табличной части.\n"
+    "Также ищи существенные условия договора: суммы и цены платежей, размер аванса, "
+    "штрафы, пени, неустойки (тип amount); сроки поставки, оплаты, гарантии и "
+    "гарантийные сроки (тип term); наименования товаров, работ и услуг — конкретные "
+    "значения, а не заголовки «Товар», «Работа», «Услуга» (тип item).\n"
+    "Суммы и сроки возвращай целиком, как в тексте, вместе с валютой и единицей "
+    "измерения. Для банка возвращай наименование банка "
+    "(тип bank), для товара/работы/услуги — конкретное наименование (тип item).\n"
     "Ищи в любом оформлении: ЖИРНЫЙ, курсив, подчёркивание, ВЕРХНИЙ РЕГИСТР, разряженный "
     "текст, в кавычках, в таблицах, в реквизитах и в блоках электронной подписи.\n"
     "Если одно и то же название встречается в разных написаниях — верни каждое написание "
@@ -1259,10 +1664,10 @@ LLM_SYSTEM = (
 )
 
 LLM_TYPES = (
-    "type: fio | fio_initials | surname | name | patronymic | org | org_name | abbr | "
-    "address | city | street | house | apartment | index | position | signature | "
-    "email | phone | inn | ogrn | kpp | bik | rs | snils | passport | birthdate | date | "
-    "number | other"
+    "type: fio | fio_initials | surname | name | patronymic | org | org_name | bank | "
+    "amount | term | item | abbr | address | city | street | house | apartment | index | "
+    "position | signature | email | phone | inn | ogrn | kpp | bik | rs | snils | "
+    "passport | birthdate | date | number | other"
 )
 
 
@@ -1307,9 +1712,18 @@ def detect_pii_llm(text: str) -> Tuple[List[Dict[str, str]], bool, str]:
             f"Текст документа:\n{chunk}\n\n"
             "Менять можно только значения. Не возвращай заголовки колонок и подписи "
             "полей («Услуги», «Товары», «Назначение», «Количество», «Цена», «Сумма»). "
-            'Верни только JSON-массив: [{"text":"Иванов Иван Иванович","type":"fio"}, '
-            '{"text":"ООО «Ромашка»","type":"org"}, {"text":"г. Москва, ул. Тверская, д. 1",'
-            '"type":"address"}]. Если нечего менять — [].'
+            "Обязательно найди названия сторон договора после подписей «Поставщик», "
+            "«Покупатель», «Заказчик», «Исполнитель», «Подрядчик», «Арендодатель», "
+            "«Арендатор», «Сторона 1», «Сторона 2»; полные юридические формы "
+            "организаций и ИП; реквизиты и банки; суммы платежей (amount); сроки "
+            "поставки и гарантии (term); конкретные наименования товаров, работ и "
+            "услуг (item). "
+            "Верни только JSON-массив, где text — дословная цитата из документа, "
+            "type — тип: "
+            '[{"text":"...","type":"fio"}, {"text":"...","type":"org"}, '
+            '{"text":"...","type":"bank"}, {"text":"...","type":"amount"}, '
+            '{"text":"...","type":"term"}, {"text":"...","type":"item"}, '
+            '{"text":"...","type":"address"}]. Если нечего менять — [].'
         )
         try:
             resp = llm.invoke([("system", LLM_SYSTEM), ("human", prompt)])
@@ -1374,20 +1788,18 @@ def expand_variants(extras: List[Dict[str, str]]) -> List[Dict[str, str]]:
         if kind in ("fio", "signature"):
             add_fio_variants(v)
         if kind in ("org", "org_name"):
-            m = re.match(
-                r"(?i)^(ООО|ОАО|ЗАО|ПАО|АО|ИП|ФГУП|ГУП|МУП|ГБУ|ГАУ|АНО|НКО|"
-                r"Фонд|Министерство|Департамент|Управление|Компания)\s+(.+)$", v)
-            if m and m.group(1).upper() == "ИП":
-                # «ИП Иванов Иван Иванович» — это ФИО предпринимателя, а не бренд
-                rest = m.group(2)
-                add(rest, "fio")
-                add_fio_variants(rest)
+            form, rest = _split_org(v)
+            if form and (form.upper() == "ИП" or re.search(r"(?i)индивидуальн", form)):
+                # «ИП <ФИО>» — это ФИО предпринимателя, а не бренд
+                person = rest or v
+                add(person, "fio")
+                add_fio_variants(person)
             else:
                 inner = re.findall(r"[«\"]([^»\"]{2,80})[»\"]", v)
                 if inner:
                     add(inner[0], "org_name")
-                elif m:
-                    add(m.group(2), "org_name")
+                elif form and rest:
+                    add(rest, "org_name")
         if kind == "address":
             m = re.search(r"(?i)(?:г\.|город)\s*([А-ЯЁ][\w\-]+)", v)
             if m:
@@ -1396,6 +1808,44 @@ def expand_variants(extras: List[Dict[str, str]]) -> List[Dict[str, str]]:
                           r"набережная|ш\.|шоссе)\s*([А-ЯЁ][\w\-]+)", v)
             if m:
                 add(m.group(1), "street")
+    return out
+
+
+def _augment_org_variants(text: str, extras: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Добавляет короткие названия организаций, найденные регулярками.
+
+    LLM может быть недоступна, а в договоре после полного названия «ООО «…»»
+    далее используется только бренд. Без этого варианта он остался бы открытым.
+    """
+    out = list(extras or [])
+    seen = {str(e.get("text", "")).lower() for e in out}
+
+    def add(value: str, kind: str) -> None:
+        v = _clean_value(value)
+        if not v or _is_bad_value(v):
+            return
+        key = v.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"text": v, "type": kind})
+
+    def handle(value: str) -> None:
+        form, rest = _split_org(value)
+        inner = re.findall(r"[«\"]([^»\"]{2,80})[»\"]", value)
+        if inner:
+            add(inner[0], "org_name")
+        elif form and rest:
+            add(rest, "org_name")
+
+    for kind, rx, group in GROUP_PATTERNS:
+        if kind == "org":
+            for m in rx.finditer(text or ""):
+                handle(m.group(group))
+    for kind, rx in PLAIN_PATTERNS:
+        if kind == "org":
+            for m in rx.finditer(text or ""):
+                handle(m.group(0))
     return out
 
 # ---------------------------------------------------------------- обработка файлов
@@ -2482,7 +2932,7 @@ def process_pdf(input_path: Path, output_path: Path) -> Dict[str, Any]:
         logger.warning(f"PDF scan-like: {input_path.name}, text_pages_ratio={ratio:.2f}")
     text = extract_pdf_text(input_path)
     extras, llm_ok, llm_error = detect_pii_llm(text)
-    extras = expand_variants(extras)
+    extras = _augment_org_variants(text, expand_variants(extras))
     stats = mask_pdf_file(input_path, output_path, extras)
     preview = ""
     try:
@@ -2507,7 +2957,7 @@ def process_pdf(input_path: Path, output_path: Path) -> Dict[str, Any]:
 def process_excel(input_path: Path, output_path: Path) -> Dict[str, Any]:
     text = extract_excel_text(input_path)
     extras, llm_ok, llm_error = detect_pii_llm(text)
-    extras = expand_variants(extras)
+    extras = _augment_org_variants(text, expand_variants(extras))
     stats = mask_excel_file(input_path, output_path, extras)
     result: Dict[str, Any] = {"preview_type": "excel", "preview": stats.pop("preview_rows", []),
                               "llm_used": llm_ok,
@@ -2594,13 +3044,14 @@ def process(file: UploadFile = File(...), user: str = Depends(get_current_user))
     in_path.write_bytes(content)
 
     started = time.time()
-    try:
-        result = process_pdf(in_path, out_path) if ext == ".pdf" else process_excel(in_path, out_path)
-    except Exception as e:
-        logger.error(f"PROCESS_ERROR | {user} | {original} | {e}")
-        raise HTTPException(500, f"Ошибка обработки: {e}")
-    finally:
-        in_path.unlink(missing_ok=True)
+    with PROCESS_LOCK:
+        try:
+            result = process_pdf(in_path, out_path) if ext == ".pdf" else process_excel(in_path, out_path)
+        except Exception as e:
+            logger.error(f"PROCESS_ERROR | {user} | {original} | {e}")
+            raise HTTPException(500, f"Ошибка обработки: {e}")
+        finally:
+            in_path.unlink(missing_ok=True)
 
     elapsed = round(time.time() - started, 1)
     logger.info(f"MASK | user={user} | file={original} | masked={result.get('masked')} | "
