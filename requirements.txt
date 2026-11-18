@@ -1,10 +1,12 @@
 fastapi==0.115.6
+pydantic==2.14.3
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
 openpyxl==3.1.5
 pymupdf==2.1
 langchain-core==1.7.6
 langchain-openai==1.7.4
+openai==3.46.0
 pyinstaller==6.11.1
 pystray>=0.19
 pillow>=10.0
