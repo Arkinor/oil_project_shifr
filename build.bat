@@ -35,7 +35,7 @@ if exist "icon.ico" (
 )
 
 echo Building exe...
-pyinstaller --noconfirm --clean --onefile --noconsole --name %APP% %ICON_ARG% --add-data "index.html;." %ICON_DATA% --collect-submodules uvicorn --collect-submodules langchain_core --collect-submodules langchain_openai --collect-submodules openai --collect-data faker --collect-submodules pymupdf --collect-submodules openpyxl %TRAY_HIDDEN% %TRAY_ARGS% --hidden-import uvicorn.logging --hidden-import uvicorn.loops.auto --hidden-import uvicorn.loops.asyncio --hidden-import uvicorn.protocols.http.auto --hidden-import uvicorn.protocols.http.h11_impl --hidden-import uvicorn.protocols.websockets.auto --hidden-import uvicorn.lifespan.on --hidden-import uvicorn.lifespan.off main.py
+pyinstaller --noconfirm --clean --onefile --noconsole --name %APP% %ICON_ARG% --add-data "index.html;." %ICON_DATA% --collect-submodules uvicorn --collect-submodules langchain_core --collect-submodules langchain_openai --collect-submodules openai --collect-submodules pymupdf --collect-submodules openpyxl %TRAY_HIDDEN% %TRAY_ARGS% --hidden-import uvicorn.logging --hidden-import uvicorn.loops.auto --hidden-import uvicorn.loops.asyncio --hidden-import uvicorn.protocols.http.auto --hidden-import uvicorn.protocols.http.h11_impl --hidden-import uvicorn.protocols.websockets.auto --hidden-import uvicorn.lifespan.on --hidden-import uvicorn.lifespan.off main.py
 if errorlevel 1 goto err
 
 if exist "settings.json" (
