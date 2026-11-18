@@ -31,6 +31,9 @@ SETTINGS_FILE = APP_DIR / "settings.json"
 USERS_FILE = DATA_DIR / "users.json"
 LOG_FILE = DATA_DIR / "activity.log"
 SERVER_LOG_FILE = DATA_DIR / "server.log"
+# Журнал обезличивания: логин -> имя файла -> найденные пары original/replacement.
+# Дополняется по ходу обработки, чтобы было видно, что уходит в модель.
+MASK_LOG_FILE = DATA_DIR / "masking_log.json"
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "lm_studio_url": "http://127.0.0.1:1234/v1",

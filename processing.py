@@ -23,8 +23,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from config import (IMAGE_EXTS, OUTPUT_DIR, STATE_DIR, UPLOAD_DIR,
-                    load_settings, logger)
+from config import (IMAGE_EXTS, MASK_LOG_FILE, OUTPUT_DIR, STATE_DIR,
+                    UPLOAD_DIR, load_settings, logger)
 
 
 # ================================================================
@@ -70,11 +70,13 @@ def user_jobs_dir(login: str) -> Path:
     return _user_dir(STATE_DIR, login) / "jobs"
 
 
-def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+def _atomic_write_json(path: Path, data: Dict[str, Any],
+                       indent: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     try:
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=indent),
+                       encoding="utf-8")
         os.replace(tmp, path)
     except Exception as e:
         logger.error(f"job save {path.name}: {e}")
@@ -229,6 +231,10 @@ def prune_history() -> None:
 
 def _run_job(job_id: str, in_path: Path, out_path: Path, ext: str) -> None:
     started = time.time()
+    with JOBS_LOCK:
+        job = dict(JOBS.get(job_id) or {})
+    owner = str(job.get("user") or "")
+    source_name = str(job.get("filename") or in_path.name)
     with PROCESS_LOCK:
         _update_job(job_id, status="processing", progress=1,
                     stage="Подготовка документа", started=started)
@@ -240,14 +246,18 @@ def _run_job(job_id: str, in_path: Path, out_path: Path, ext: str) -> None:
         try:
             logger.info(f"PROCESS_START | job={job_id} | {in_path.name} | ext={ext}")
             if ext == ".pdf":
-                result = process_pdf(in_path, out_path, progress=report)
+                result = process_pdf(in_path, out_path, progress=report,
+                                     user=owner, filename=source_name)
             elif ext in IMAGE_EXTS:
-                result = process_image(in_path, out_path, progress=report)
+                result = process_image(in_path, out_path, progress=report,
+                                       user=owner, filename=source_name)
             elif ext in (".docx", ".doc"):
                 result = (process_doc if ext == ".doc" else process_docx)(
-                    in_path, out_path, progress=report)
+                    in_path, out_path, progress=report,
+                    user=owner, filename=source_name)
             else:
-                result = process_excel(in_path, out_path, progress=report)
+                result = process_excel(in_path, out_path, progress=report,
+                                       user=owner, filename=source_name)
             logger.info(f"PROCESS_DONE | job={job_id} | {in_path.name} | "
                         f"{round(time.time() - started, 1)} s | "
                         f"masked={result.get('masked')} | llm_used={result.get('llm_used')}")
@@ -269,6 +279,78 @@ def _run_job(job_id: str, in_path: Path, out_path: Path, ext: str) -> None:
                 in_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+
+# ================================================================
+# 1b. ЖУРНАЛ ОБЕЗЛИЧИВАНИЯ
+# ================================================================
+# data/masking_log.json — человекочитаемый журнал:
+#   { "<логин>": { "<имя файла>": [ {"time", "page", "original",
+#                                    "replacement", "type"}, ... ] } }
+# Пишется по мере обработки фрагментов, чтобы было видно, что именно
+# заменяется, даже если документ обработается не полностью. Одинаковые пары
+# повторно не добавляются, поэтому журнал можно безопасно дополнять.
+MASK_LOG_LOCK = threading.Lock()
+
+
+def _load_mask_log() -> Dict[str, Any]:
+    if not MASK_LOG_FILE.exists():
+        return {}
+    try:
+        data = json.loads(MASK_LOG_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"MASK_LOG | чтение {MASK_LOG_FILE.name}: {e}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _append_mask_log(user: str, filename: str, items: List[Dict[str, str]],
+                     page: str = "") -> None:
+    """Дописывает найденные пары в data/masking_log.json.
+
+    Ключи — логин и исходное имя файла. Сбой журнала не должен прерывать
+    обезличивание, поэтому все ошибки только логируются.
+    """
+    if not user or not filename or not items:
+        return
+    stamp = datetime_cls.now().isoformat(timespec="seconds")
+    try:
+        with MASK_LOG_LOCK:
+            data = _load_mask_log()
+            files = data.get(user)
+            if not isinstance(files, dict):
+                files = {}
+                data[user] = files
+            rows = files.get(filename)
+            if not isinstance(rows, list):
+                rows = []
+                files[filename] = rows
+            seen = {(str(row.get("original")), str(row.get("replacement")))
+                    for row in rows if isinstance(row, dict)}
+            added = 0
+            for item in items:
+                original = str(item.get("original") or "")
+                replacement = str(item.get("replacement") or "")
+                if not original or not replacement:
+                    continue
+                key = (original, replacement)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({
+                    "time": stamp,
+                    "page": page,
+                    "original": original,
+                    "replacement": replacement,
+                    "type": str(item.get("type") or ""),
+                    "source": str(item.get("source") or "llm"),
+                })
+                added += 1
+            if added:
+                _atomic_write_json(MASK_LOG_FILE, data, indent=2)
+                logger.info(f"MASK_LOG | {user} | {filename} | +{added} замен")
+    except Exception as e:
+        logger.warning(f"MASK_LOG | запись {filename}: {e}")
 
 
 # ================================================================
@@ -324,8 +406,24 @@ def _flex_pattern(value: str) -> str | None:
     v = (v.replace("«", '"').replace("»", '"').replace("„", '"')
          .replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'"))
     parts: List[str] = []
+    # «М. В.» и «М.В.» — одно и то же: склеиваем соседние инициалы в один токен.
+    tokens: List[str] = []
     for tok in v.split(" "):
         if not tok:
+            continue
+        if (tokens
+                and re.fullmatch(r"[А-ЯЁA-Z]\.?", tok, re.I)
+                and re.fullmatch(r"[А-ЯЁA-Z](?:\.[А-ЯЁA-Z])*\.?",
+                                 tokens[-1], re.I)):
+            tokens[-1] += tok
+        else:
+            tokens.append(tok)
+    for tok in tokens:
+        # Инициалы: «М.В.» и «М. В.» — один и тот же человек.
+        if re.fullmatch(r"[А-ЯЁA-Z](?:\.[А-ЯЁA-Z])*\.?", tok, re.I):
+            letters = re.findall(r"[А-ЯЁA-Z]", tok, re.I)
+            e = r"\.?\s*".join(re.escape(ch) for ch in letters) + r"\.?"
+            parts.append(e)
             continue
         e = re.escape(tok)
         e = e.replace(r"\.", r"\.?")
@@ -339,7 +437,9 @@ def _flex_pattern(value: str) -> str | None:
     # Кавычки могут стоять вокруг всего значения или каждого слова
     # («ООО «Ромашка»» в тексте против «ООО Ромашка» в ответе модели).
     wrapped = [r'["«»„“”]?' + part + r'[»"]?' for part in parts]
-    return r"(?<!\w)" + r"\s+".join(wrapped) + r"(?!\w)"
+    # Подчёркивание — разделитель, а не буква: «___Иванов И.И.» должно
+    # находиться. Внутри слов границы по-прежнему запрещены.
+    return r"(?<![^\W_])" + r"\s+".join(wrapped) + r"(?![^\W_])"
 
 
 def _find_occurrences(text: str, value: str) -> List[re.Match]:
@@ -798,7 +898,8 @@ ANON_SYSTEM = (
     'Если менять нечего — верни {"replacements": []}.\n\n'
     "ЧУВСТВИТЕЛЬНЫЕ ДАННЫЕ:\n"
     "— ФИО полностью и по частям: фамилия, имя, отчество, инициалы в любом порядке; "
-    "ФИО в верхнем регистре, в кавычках, латиницей;\n"
+    "ФИО в верхнем регистре, в кавычках, латиницей; ФИО в подписях и расшифровках, "
+    "в том числе сразу после линии подчёркивания («___Иванов И.И.») и рядом с «М.П.»;\n"
     "— организации: полные юридические формы и краткие названия, бренды, "
     "аббревиатуры (ООО, АО, ПАО, ИП и т.п. вместе с названием), банки;\n"
     "— адреса целиком и по частям: страна, регион, город, улица, дом, корпус, "
@@ -829,8 +930,8 @@ ANON_SYSTEM = (
     "товара — другое название; город — другой город. Не ставь имя на место "
     "должности или организации и наоборот.\n"
     "4. Указывай все варианты одного значения во фрагменте: полное ФИО и "
-    "отдельную фамилию, полное и краткое название, адрес и его части, сумму "
-    "цифрами и прописью.\n"
+    "краткое «Фамилия И.О.», отдельную фамилию, полное и краткое название, "
+    "адрес и его части, сумму цифрами и прописью.\n"
     "5. original должен быть достаточно длинным и однозначным. Не возвращай "
     "отдельные цифры, буквы и общие слова.\n"
     "6. Если фрагмент начинается или заканчивается посреди значения — не угадывай: "
@@ -1337,7 +1438,9 @@ def _request_replacements(llm, settings: Dict[str, Any], chunk: Dict[str, Any],
 
 def anonymize_text(text: str,
                    segments: List[Dict[str, Any]] | None = None,
-                   progress: Any = None) -> Tuple[List[Dict[str, str]], bool, str]:
+                   progress: Any = None,
+                   user: str = "",
+                   filename: str = "") -> Tuple[List[Dict[str, str]], bool, str]:
     """Прогоняет через модель весь текст документа и собирает согласованные замены.
 
     Возвращает (замены, успех, ошибка). Если хотя бы один фрагмент не удалось
@@ -1388,13 +1491,24 @@ def anonymize_text(text: str,
             return [], False, error or "llm_failed"
         processed += len(chunk["text"])
         added = 0
+        new_items: List[Dict[str, str]] = []
         for item in got:
             key = item["original"].lower()
             if key in known:
                 continue
             known[key] = (item["original"], item["replacement"])
             replacements.append(item)
+            new_items.append(item)
             added += 1
+        log_items: List[Dict[str, str]] = list(new_items)
+        for item in new_items:
+            for short, short_fake in _signature_pairs(
+                    item["original"], item["replacement"],
+                    str(item.get("type") or "")):
+                log_items.append({"original": short, "replacement": short_fake,
+                                  "type": str(item.get("type") or ""),
+                                  "source": "signature"})
+        _append_mask_log(user, filename, log_items, page=chunk["label"])
         logger.info(f"LLM | {chunk['label']} | символов {len(chunk['text'])} | "
                     f"новых замен {added} | пропущено дублей {len(got) - added}")
     if progress:
@@ -1421,20 +1535,95 @@ def _llm_failure_message(error: str) -> str:
     return "LLM не отвечает — обработка отменена" + (f": {error[:200]}" if error else "")
 
 
+# Окончания фамилий, которые можно отрезать, чтобы получить основу:
+# «Капишниковой» -> «Капишников», «Зинурова» -> «Зинуров».
+_SURNAME_ENDINGS = (
+    "ого", "его", "ому", "ему", "ыми", "ими", "ой", "ей", "ый", "ий",
+    "ом", "ем", "ым", "им", "ам", "ям", "ах", "ях",
+    "а", "я", "у", "ю", "ы", "и", "е",
+)
+
+
+def _surname_stem(surname: str) -> str:
+    value = _clean_value(surname)
+    low = value.lower().replace("ё", "е")
+    for end in _SURNAME_ENDINGS:
+        if low.endswith(end) and len(value) - len(end) >= 4:
+            return value[:len(value) - len(end)]
+    return value
+
+
+def _name_initials(parts: List[str]) -> str:
+    letters = [p[0].upper() for p in parts[:2] if p and p[0].isalpha()]
+    return ".".join(letters) + "." if len(letters) == 2 else ""
+
+
+def _signature_pairs(original: str, replacement: str,
+                     kind: str = "") -> List[Tuple[str, str]]:
+    """Короткие ФИО для подписей: «Капишникова М.В.» из полного ФИО.
+
+    Модель видит полное ФИО в тексте, но может не вернуть его краткую форму
+    в блоке подписей. Пары строятся из уже согласованной замены: основа
+    фамилии берётся из original/replacement, инициалы — из имени и отчества.
+    """
+    if not any(tag in str(kind).lower()
+               for tag in ("фио", "физ", "person", "name")):
+        return []
+    orig = _clean_value(original).split()
+    fake = _clean_value(replacement).split()
+    if len(orig) < 3 or len(fake) < 3:
+        return []
+    o_init = _name_initials(orig[1:])
+    f_init = _name_initials(fake[1:])
+    if not o_init or not f_init:
+        return []
+    o_stem = _surname_stem(orig[0])
+    f_stem = _surname_stem(fake[0])
+    if not o_stem or not f_stem:
+        return []
+    # Женские формы идут первыми: подпись «Капишникова М.В.» должна получить
+    # женскую замену. Мужская форма — основа без окончания.
+    forms = [
+        (f"{o_stem}а {o_init}", f"{f_stem}а {f_init}"),
+        (f"{o_stem}ая {o_init}", f"{f_stem}а {f_init}"),
+        (f"{o_stem} {o_init}", f"{f_stem} {f_init}"),
+        (f"{orig[0]} {o_init}", f"{fake[0]} {f_init}"),
+    ]
+    result: List[Tuple[str, str]] = []
+    seen = set()
+    for short, short_fake in forms:
+        if short not in seen:
+            seen.add(short)
+            result.append((short, short_fake))
+    return result
+
+
 def _build_replacement_masker(replacements: Any) -> Masker:
     masker = Masker()
     for item in replacements or []:
         if isinstance(item, dict):
-            masker.set_exact(item.get("original") or "", item.get("replacement") or "")
+            original = item.get("original") or ""
+            replacement = item.get("replacement") or ""
+            masker.set_exact(original, replacement)
+            for short, short_fake in _signature_pairs(
+                    original, replacement, str(item.get("type") or "")):
+                masker.set_exact(short, short_fake)
     return masker
 
 
 def _replacement_extras(replacements: Any) -> List[Dict[str, str]]:
     extras: List[Dict[str, str]] = []
     for item in replacements or []:
-        original = (item.get("original") or "") if isinstance(item, dict) else ""
-        if original:
-            extras.append({"text": original, "type": str(item.get("type") or "")})
+        if not isinstance(item, dict):
+            continue
+        original = item.get("original") or ""
+        if not original:
+            continue
+        kind = str(item.get("type") or "")
+        extras.append({"text": original, "type": kind})
+        for short, _ in _signature_pairs(original,
+                                         item.get("replacement") or "", kind):
+            extras.append({"text": short, "type": kind})
     return extras
 
 
@@ -2853,7 +3042,8 @@ def _doc_to_docx(src: Path, dst: Path) -> None:
 
 
 def process_doc(input_path: Path, output_path: Path,
-                progress: Any = None) -> Dict[str, Any]:
+                progress: Any = None, user: str = "",
+                filename: str = "") -> Dict[str, Any]:
     def report(pct: int, stage: str) -> None:
         if progress:
             progress(max(0, min(99, int(pct))), stage)
@@ -2862,7 +3052,8 @@ def process_doc(input_path: Path, output_path: Path,
     tmp = input_path.with_name(f"{input_path.stem}.converted.docx")
     try:
         _doc_to_docx(input_path, tmp)
-        result = process_docx(tmp, output_path, progress=progress)
+        result = process_docx(tmp, output_path, progress=progress,
+                              user=user, filename=filename)
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -2873,7 +3064,8 @@ def process_doc(input_path: Path, output_path: Path,
 
 
 def process_docx(input_path: Path, output_path: Path,
-                 progress: Any = None) -> Dict[str, Any]:
+                 progress: Any = None, user: str = "",
+                 filename: str = "") -> Dict[str, Any]:
     def report(pct: int, stage: str) -> None:
         if progress:
             progress(max(0, min(99, int(pct))), stage)
@@ -2886,7 +3078,8 @@ def process_docx(input_path: Path, output_path: Path,
     _prepare_llm(report)
     report(5, "Поиск персональных данных")
     replacements, llm_ok, llm_error = anonymize_text(
-        text, segments, _progress_callback(progress, 5, 67, "Обезличивание текста"))
+        text, segments, _progress_callback(progress, 5, 67, "Обезличивание текста"),
+        user=user, filename=filename or input_path.name)
     if not llm_ok:
         raise RuntimeError(_llm_failure_message(llm_error))
     report(73, "Применение замен")
@@ -3101,7 +3294,8 @@ def mask_image_file(input_path: Path, output_path: Path, lines: List[Dict[str, A
 
 
 def process_image(input_path: Path, output_path: Path,
-                  progress: Any = None) -> Dict[str, Any]:
+                  progress: Any = None, user: str = "",
+                  filename: str = "") -> Dict[str, Any]:
     def report(pct: int, stage: str) -> None:
         if progress:
             progress(max(0, min(99, int(pct))), stage)
@@ -3116,7 +3310,8 @@ def process_image(input_path: Path, output_path: Path,
                            "(rus+eng) или используйте мультимодальную модель LM Studio")
     report(8, "Поиск персональных данных")
     replacements, llm_ok, llm_error = anonymize_text(
-        text, _ocr_segments(lines), _progress_callback(progress, 8, 64, "Обезличивание текста"))
+        text, _ocr_segments(lines), _progress_callback(progress, 8, 64, "Обезличивание текста"),
+        user=user, filename=filename or input_path.name)
     if not llm_ok:
         raise RuntimeError(_llm_failure_message(llm_error))
     report(73, "Применение замен")
@@ -3142,7 +3337,8 @@ def _progress_callback(progress: Any, start: int, span: int, stage: str):
 
 
 def process_pdf(input_path: Path, output_path: Path,
-                progress: Any = None) -> Dict[str, Any]:
+                progress: Any = None, user: str = "",
+                filename: str = "") -> Dict[str, Any]:
     def report(pct: int, stage: str) -> None:
         if progress:
             progress(max(0, min(99, int(pct))), stage)
@@ -3158,7 +3354,8 @@ def process_pdf(input_path: Path, output_path: Path,
     _prepare_llm(report)
     report(5, "Поиск персональных данных")
     replacements, llm_ok, llm_error = anonymize_text(
-        text, segments, _progress_callback(progress, 5, 67, "Обезличивание текста"))
+        text, segments, _progress_callback(progress, 5, 67, "Обезличивание текста"),
+        user=user, filename=filename or input_path.name)
     if not llm_ok:
         raise RuntimeError(_llm_failure_message(llm_error))
     report(73, "Применение замен")
@@ -3188,7 +3385,8 @@ def process_pdf(input_path: Path, output_path: Path,
 
 
 def process_excel(input_path: Path, output_path: Path,
-                  progress: Any = None) -> Dict[str, Any]:
+                  progress: Any = None, user: str = "",
+                  filename: str = "") -> Dict[str, Any]:
     def report(pct: int, stage: str) -> None:
         if progress:
             progress(max(0, min(99, int(pct))), stage)
@@ -3199,7 +3397,8 @@ def process_excel(input_path: Path, output_path: Path,
     _prepare_llm(report)
     report(5, "Поиск персональных данных")
     replacements, llm_ok, llm_error = anonymize_text(
-        text, segments, _progress_callback(progress, 5, 67, "Обезличивание текста"))
+        text, segments, _progress_callback(progress, 5, 67, "Обезличивание текста"),
+        user=user, filename=filename or input_path.name)
     if not llm_ok:
         raise RuntimeError(_llm_failure_message(llm_error))
     report(73, "Применение замен")
