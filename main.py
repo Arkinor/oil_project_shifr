@@ -28,7 +28,9 @@ import math
 import os
 import random
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -165,8 +167,9 @@ def _run_job(job_id: str, in_path: Path, out_path: Path, ext: str) -> None:
                 result = process_pdf(in_path, out_path, progress=report)
             elif ext in IMAGE_EXTS:
                 result = process_image(in_path, out_path, progress=report)
-            elif ext == ".docx":
-                result = process_docx(in_path, out_path, progress=report)
+            elif ext in (".docx", ".doc"):
+                result = (process_doc if ext == ".doc" else process_docx)(
+                    in_path, out_path, progress=report)
             else:
                 result = process_excel(in_path, out_path, progress=report)
             logger.info(f"PROCESS_DONE | job={job_id} | {in_path.name} | "
@@ -407,6 +410,42 @@ _LABEL_PREFIX_RE = re.compile(
     r"ОРГАНИЗАЦИЯ|НАИМЕНОВАНИЕ|ДОЛЖНОСТЬ|ПРОФЕССИЯ|"
     r"ДАТА\s+РОЖДЕНИЯ|РАСШИФРОВКА\s+ПОДПИСИ|"
     r"ПОДПИСЬ|ПОДПИСАНТ|ГРАЖДАНИН|ГРАЖДАНКА|ФИЗЛИЦО)\s*[:\-]?\s*", re.I)
+
+# Типы, для которых Masker умеет сам сделать замену того же формата. Слабая
+# модель иногда повторяет исходное число/дату или оставляет replacement пустым:
+# такие значения не выбрасываем, а отдаём на генерацию программе.
+_AUTO_FAKE_KINDS = {
+    "amount", "term", "date", "birthdate", "number", "inn", "ogrn", "ogrn_bare",
+    "kpp", "bik", "rs", "snils", "passport", "phone", "email", "index",
+    "house", "apartment",
+}
+_DIGIT_KINDS = _AUTO_FAKE_KINDS - {"email"}
+
+# Подписи полей и заголовки: их модель иногда принимает за значения.
+_STRUCTURAL_WORDS = {
+    "банк", "банка", "получателя", "получатель", "бик", "корр",
+    "корреспондентский", "корреспондентского", "счет", "счета", "расчетный",
+    "расчетного", "инн", "кпп", "огрн", "огрнип", "снилс", "поставщик",
+    "покупатель", "заказчик", "исполнитель", "подрядчик", "арендодатель",
+    "арендатор", "сторона", "стороны", "услуга", "услуги", "товар", "товары",
+    "работа", "работы", "назначение", "платежа", "платеж", "наименование",
+    "количество", "кол", "ед", "изм", "цена", "стоимость", "сумма", "итого",
+    "всего", "дата", "номер", "код", "период", "основание", "категория",
+    "реквизиты", "подпись", "адрес", "должность", "профессия", "телефон",
+    "тел", "email", "почта", "ндс", "в", "том", "числе",
+}
+
+
+def _is_label_only(value: str) -> bool:
+    """Значение состоит только из слов-подписей полей («Банк получателя»)."""
+    cleaned = _clean_value(value)
+    if not cleaned:
+        return True
+    if re.search(r"\d", cleaned):
+        return False
+    words = [w for w in re.findall(r"[a-zа-яё]+", cleaned.lower().replace("ё", "е"))
+             if len(w) > 1]
+    return bool(words) and all(w in _STRUCTURAL_WORDS for w in words)
 
 
 _ZERO_WIDTH = "\u00ad\u200b\u200c\u200d\ufeff"
@@ -1540,37 +1579,45 @@ def _prepare_llm(report: Any = None) -> None:
 
 ANON_SYSTEM = (
     "Ты — система обезличивания документов. Тебе дают фрагмент текста. "
-    "Твоя задача — найти в нём персональные и конфиденциальные данные и "
-    "вернуть СПИСОК ЗАМЕН в JSON.\n"
+    "Найди в нём персональные и конфиденциальные данные и верни СПИСОК ЗАМЕН в JSON.\n"
     "Формат ответа — строго один JSON-объект:\n"
     '{"replacements":[{"original":"точная подстрока из фрагмента",'
     '"replacement":"вымышленное значение","type":"тип"}]}\n'
     "Правила:\n"
-    "1. original — подстрока фрагмента символ в символ, без изменений. "
-    "Одно значение указывай один раз: программа заменит все его вхождения.\n"
-    "2. replacement — правдоподобное вымышленное значение того же формата: "
-    "длина и вид чисел, разделители, валюта, единицы измерения, кавычки, регистр.\n"
+    "1. original — подстрока фрагмента символ в символ. Копируй только само "
+    "значение, без подписи поля: «7701234567», а не «ИНН 7701234567». "
+    "Одно значение указывай один раз.\n"
+    "2. replacement — обязательно ДРУГОЕ правдоподобное значение того же вида: "
+    "та же длина, разделители, валюта, единицы измерения, кавычки, регистр. "
+    "Для чисел и дат меняй цифры, но сохраняй формат. Никогда не повторяй original.\n"
     "3. type — одно из: fio, fio_initials, fio_lat, surname, name, patronymic, "
     "org, org_name, abbr, address, address_lat, city, street, house, apartment, "
     "index, phone, email, passport, snils, inn, ogrn, kpp, bik, rs, bank, "
     "amount, term, item, position, signature, date, extra.\n"
-    "4. Меняй ТОЛЬКО значения: ФИО полностью и по частям, инициалы; названия "
-    "организаций (полные, краткие, бренды, аббревиатуры), ИП; адреса и их части; "
-    "телефоны, email; паспорт, СНИЛС, ИНН, ОГРН/ОГРНИП, КПП, БИК, счета; "
-    "названия банков; суммы, цены, авансы, штрафы, пени; сроки и гарантии; "
-    "конкретные наименования товаров, работ и услуг; должности и подписи.\n"
-    "5. НЕ включай в replacements заголовки разделов и абзацев, названия таблиц, "
-    "заголовки колонок и граф, подписи полей, служебные слова, нумерацию и даты "
-    "документа. Например, «Услуги», «Товары», «Назначение», «Наименование», "
+    "4. ОБЯЗАТЕЛЬНО заменяй конкретные значения:\n"
+    "— ФИО полностью и по частям, инициалы (в том числе рядом с «Директор», "
+    "«Главный бухгалтер», «Подписант»);\n"
+    "— названия организаций (полные, краткие, бренды, аббревиатуры) и ИП;\n"
+    "— адреса целиком и по частям: город, улица, дом, корпус, квартира/офис, индекс;\n"
+    "— телефоны и email;\n"
+    "— паспорт, СНИЛС, ИНН, ОГРН/ОГРНИП, КПП, БИК, расчётные и корр. счета;\n"
+    "— названия банков;\n"
+    "— суммы, цены, итоги, авансы, штрафы, пени, НДС — цифрами и прописью;\n"
+    "— даты (документа, рождения, поставки, оплаты) и сроки/гарантии;\n"
+    "— конкретные наименования товаров, работ, услуг в таблицах и тексте;\n"
+    "— должности и подписи.\n"
+    "5. НЕ включай подписи полей, заголовки колонок и разделов, названия таблиц, "
+    "служебные слова и нумерацию строк. Например: «Банк получателя», "
+    "«БИК · корр. счёт», «Получатель · ИНН / КПП», «Расчётный счёт», «Поставщик», "
+    "«Покупатель», «Услуги», «Товары», «Назначение», «Наименование», "
     "«Количество», «Ед. изм.», «Цена», «Стоимость», «Сумма», «Итого», «Всего», "
     "«Дата», «Номер», «Код», «Период», «Основание», «Категория», «Реквизиты», "
     "«Подпись», «ИНН», «КПП», «Адрес» — это подписи, их менять нельзя.\n"
-    "6. Включи ВСЕ встречающиеся варианты: полное ФИО, фамилию отдельно, "
+    "6. Включи ВСЕ встречающиеся варианты: полное ФИО и фамилию отдельно, "
     "инициалы; полное и краткое название организации, бренд; адрес целиком и "
     "отдельные части; сумму цифрами и прописью, если обе есть.\n"
     "7. original должен быть достаточно длинным и однозначным, чтобы не "
-    "совпасть в другом смысле: добавляй контекст («д. 5», «ИНН 7701234567»), "
-    "но не захватывай саму подпись поля. Не указывай отдельные цифры и буквы.\n"
+    "совпасть в другом смысле. Не указывай отдельные цифры и буквы.\n"
     "8. Экранируй кавычки и переводы строк по правилам JSON.\n"
     "Если менять нечего — верни {\"replacements\": []}. "
     "Ответ — только JSON, без markdown и пояснений."
@@ -1683,6 +1730,7 @@ def _parse_replacements(raw: str, chunk: str) -> List[Dict[str, str]] | None:
         return None
     out: List[Dict[str, str]] = []
     seen: set[str] = set()
+    dropped_not_found = dropped_label = dropped_empty = dropped_bad = 0
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -1691,19 +1739,51 @@ def _parse_replacements(raw: str, chunk: str) -> List[Dict[str, str]] | None:
                        or item.get("fake") or "")
         original = str(original).strip()
         replacement = str(replacement).strip()
-        if not original or not replacement or original == replacement:
+        if not original:
             continue
         located = _locate_value(chunk, original)
-        if not located or _is_bad_value(located) or _is_bad_value(replacement):
+        if not located:
+            dropped_not_found += 1
+            continue
+        # Модель могла захватить подпись поля («ИНН 7701234567»): оставляем
+        # подпись в документе, а заменяем только само значение.
+        cleaned = _clean_value(located)
+        if cleaned and cleaned != located:
+            inner = _locate_value(chunk, cleaned)
+            if inner:
+                located = inner
+        if _is_label_only(located):
+            dropped_label += 1
+            continue
+        kind = _map_kind(str(item.get("type") or item.get("kind") or "")) \
+            or _infer_kind(located)
+        same = (not replacement
+                or _clean_value(replacement).lower() == _clean_value(located).lower())
+        word_amount = (kind in ("amount", "term") and _NUM_WORD_RE.search(located))
+        if same or word_amount:
+            if (kind in _AUTO_FAKE_KINDS
+                    and (kind not in _DIGIT_KINDS or re.search(r"\d", located)
+                         or kind in ("amount", "term"))
+                    and (kind != "email" or "@" in located)):
+                # replacement сгенерирует Masker: формат, длина и контрольные
+                # цифры сохранятся, а сумма/срок прописью станут «по договору».
+                replacement = ""
+            else:
+                dropped_empty += 1
+                continue
+        if _is_bad_value(located) or (replacement and _is_bad_value(replacement)):
+            dropped_bad += 1
             continue
         key = located.lower()
         if key in seen:
             continue
         seen.add(key)
-        out.append({"original": located,
-                    "replacement": replacement,
-                    "type": _map_kind(str(item.get("type") or item.get("kind") or ""))
-                            or _infer_kind(located)})
+        out.append({"original": located, "replacement": replacement, "type": kind})
+    dropped = dropped_not_found + dropped_label + dropped_empty + dropped_bad
+    if dropped:
+        logger.info(f"LLM replacements: принято {len(out)}, пропущено {dropped} "
+                    f"(нет в тексте {dropped_not_found}, подписи полей {dropped_label}, "
+                    f"повтор/пусто {dropped_empty}, непригодно {dropped_bad})")
     return out
 
 
@@ -1738,14 +1818,27 @@ def anonymize_text(text: str,
     fatal = False
     total = len(chunks)
 
-    def known_hint() -> str:
+    def known_hint(chunk: str) -> str:
         if not known:
             return ""
-        pairs = [{"original": original, "replacement": fake}
-                 for original, fake in list(known.values())[:80]]
+        # Только пары, которые реально есть в этом куске: иначе слабая модель
+        # путается в длинном списке и переносит чужие замены.
+        norm, _ = _normalize_with_map(chunk)
+        haystack = _prefilter_text(norm)
+        pairs: List[Dict[str, str]] = []
+        for original, fake in known.values():
+            if not fake:
+                continue
+            needle = _prefilter_needle(original)
+            if needle and needle not in haystack:
+                continue
+            pairs.append({"original": original, "replacement": fake})
+            if len(pairs) >= 60:
+                break
+        if not pairs:
+            return ""
         return ("Уже согласованные замены (для этих значений используй те же "
-                "replacement, если они встречаются во фрагменте; пары, которых "
-                "во фрагменте нет, не включай):\n"
+                "replacement):\n"
                 + json.dumps(pairs, ensure_ascii=False) + "\n\n")
 
     def remember(pairs: List[Dict[str, str]]) -> None:
@@ -1767,7 +1860,7 @@ def anonymize_text(text: str,
             return None
         prompt = (
             f"Правила предметной области:\n{context}\n\n"
-            f"{known_hint()}"
+            f"{known_hint(chunk)}"
             f"{label}. Найди значения, которые нужно обезличить, и верни JSON:\n\n"
             f"{chunk}"
         )
@@ -1879,7 +1972,10 @@ def extract_pdf_text(path: Path) -> str:
     try:
         if doc.needs_pass:
             raise ValueError("PDF защищён паролем")
-        return "\n".join(page.get_text("text") for page in doc)
+        # sort=True склеивает блоки в порядке чтения (сверху вниз, слева
+        # направо). Без этого подписи полей («Поставщик:») и их значения
+        # оказываются в разных местах текста, и модель теряет контекст.
+        return "\n".join(page.get_text("text", sort=True) for page in doc)
     finally:
         doc.close()
 
@@ -3119,6 +3215,82 @@ def mask_docx_file(input_path: Path, output_path: Path, extras: Any = (),
     return {"masked": masked, "pages": 1, "preview": preview}
 
 
+def _convert_with_word(src: Path, dst: Path) -> bool:
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$app=New-Object -ComObject Word.Application;"
+        "$app.Visible=$false;$app.DisplayAlerts=0;"
+        f"$doc=$app.Documents.Open('{str(src).replace(chr(39), chr(39) * 2)}',$false,$true);"
+        "try{"
+        f"$doc.SaveAs([ref]'{str(dst).replace(chr(39), chr(39) * 2)}',[ref]16)"
+        "}finally{$doc.Close(0);$app.Quit()}"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, timeout=180)
+        return proc.returncode == 0 and dst.exists() and dst.stat().st_size > 0
+    except Exception as e:
+        logger.warning(f"DOC Word convert: {e}")
+        return False
+
+
+def _convert_with_libreoffice(src: Path, dst: Path) -> bool:
+    candidates = ["soffice", "soffice.exe",
+                  r"C:\Program Files\LibreOffice\program\soffice.exe",
+                  r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"]
+    for exe in candidates:
+        try:
+            proc = subprocess.run(
+                [exe, "--headless", "--convert-to", "docx", "--outdir",
+                 str(dst.parent), str(src)],
+                capture_output=True, timeout=180)
+        except Exception:
+            continue
+        made = dst.parent / (src.stem + ".docx")
+        if proc.returncode == 0 and made.exists() and made.stat().st_size > 0:
+            if made != dst:
+                shutil.move(str(made), str(dst))
+            return True
+    return False
+
+
+def _doc_to_docx(src: Path, dst: Path) -> None:
+    """Старый .doc -> .docx. Сначала проверяем, что это не переименованный docx."""
+    try:
+        with open(src, "rb") as f:
+            head = f.read(8)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось прочитать .doc: {e}")
+    if head[:2] == b"PK":
+        shutil.copyfile(src, dst)
+        return
+    if _convert_with_word(src, dst) or _convert_with_libreoffice(src, dst):
+        return
+    raise RuntimeError("Не удалось преобразовать .doc. Установите Microsoft Word "
+                       "или LibreOffice, либо сохраните файл как .docx")
+
+
+def process_doc(input_path: Path, output_path: Path,
+                progress: Any = None) -> Dict[str, Any]:
+    def report(pct: int, stage: str) -> None:
+        if progress:
+            progress(max(0, min(99, int(pct))), stage)
+
+    report(1, "Преобразование .doc")
+    tmp = UPLOAD_DIR / f"{input_path.stem}.converted.docx"
+    try:
+        _doc_to_docx(input_path, tmp)
+        result = process_docx(tmp, output_path, progress=progress)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+    result["warning"] = "Файл .doc преобразован в .docx"
+    return result
+
+
 def process_docx(input_path: Path, output_path: Path,
                  progress: Any = None) -> Dict[str, Any]:
     def report(pct: int, stage: str) -> None:
@@ -3527,8 +3699,8 @@ def process(file: UploadFile = File(...), user: str = Depends(get_current_user))
                                  "не найдена — загрузка не начата")
     original = _safe_name(file.filename or "document")
     ext = Path(original).suffix.lower()
-    if ext not in (".pdf", ".xlsx", ".docx", *IMAGE_EXTS):
-        raise HTTPException(400, "Поддерживаются PDF, Word (.docx), Excel (.xlsx), "
+    if ext not in (".pdf", ".xlsx", ".docx", ".doc", *IMAGE_EXTS):
+        raise HTTPException(400, "Поддерживаются PDF, Word (.doc/.docx), Excel (.xlsx), "
                                  "PNG и JPG")
 
     max_mb = int(s.get("max_upload_mb", 50))
@@ -3542,7 +3714,10 @@ def process(file: UploadFile = File(...), user: str = Depends(get_current_user))
     uid = uuid.uuid4().hex[:12]
     job_id = uuid.uuid4().hex
     in_path = UPLOAD_DIR / f"{user}_{uid}_{original}"
-    out_name = f"masked_{uid}_{original}"
+    # .doc нельзя перезаписать на месте: результат всегда .docx.
+    out_ext = ".docx" if ext == ".doc" else ext
+    out_base = f"masked_{uid}_{Path(original).stem}{out_ext}"
+    out_name = out_base
     out_path = OUTPUT_DIR / out_name
     in_path.write_bytes(content)
 
@@ -3557,7 +3732,7 @@ def process(file: UploadFile = File(...), user: str = Depends(get_current_user))
         "elapsed": 0,
         "error": "",
         "created": time.time(),
-        "download_name": f"masked_{original}",
+        "download_name": out_base,
         "out_name": out_name,
         "result": None,
     }
@@ -3605,6 +3780,7 @@ def download(filename: str, user: str = Depends(get_current_user)):
     media = {
         ".pdf": "application/pdf",
         ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".doc": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         ".png": "image/png",
         ".jpg": "image/jpeg",
