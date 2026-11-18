@@ -160,9 +160,9 @@
 
       <div id="drop" class="drop" tabindex="0" role="button" aria-label="Выбрать файлы">
         <div class="title">Выберите файлы или перетащите сюда</div>
-        <div class="hint">PDF или Excel (.xlsx) — можно несколько файлов сразу</div>
+        <div class="hint">PDF, Word (.docx), Excel (.xlsx), PNG или JPG — можно несколько файлов сразу</div>
         <div id="fname" class="fname hidden"></div>
-        <input id="file" type="file" accept=".pdf,.xlsx" multiple class="hidden">
+        <input id="file" type="file" accept=".pdf,.docx,.xlsx,.png,.jpg,.jpeg" multiple class="hidden">
       </div>
 
       <div class="row">
@@ -454,7 +454,8 @@ function addFiles(fileList) {
   let added = 0;
   for (const f of files) {
     const name = (f.name || "").toLowerCase();
-    if (!name.endsWith(".pdf") && !name.endsWith(".xlsx")) { skipped.push(f.name); continue; }
+    const allowed = [".pdf", ".docx", ".xlsx", ".png", ".jpg", ".jpeg"];
+    if (!allowed.some(ext => name.endsWith(ext))) { skipped.push(f.name); continue; }
     const sameFile = q => (q.name || (q.file && q.file.name)) === f.name &&
                           q.size === f.size && q.lastModified === f.lastModified;
     // Повторно отправлять можно только файл, который уже не в работе.
@@ -500,7 +501,7 @@ function addFiles(fileList) {
   }
 
   if (skipped.length) {
-    setStatus("Пропущены (нужен PDF или .xlsx): " + skipped.join(", "), "err");
+    setStatus("Пропущены (нужен PDF, DOCX, XLSX, PNG или JPG): " + skipped.join(", "), "err");
   } else if (added) {
     setStatus("", "");
   }

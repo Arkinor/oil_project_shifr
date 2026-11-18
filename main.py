@@ -1,5 +1,5 @@
 """
-main.py — веб-сервис обезличивания PDF/Excel с локальной LLM (LM Studio).
+main.py — веб-сервис обезличивания PDF/Word/Excel/изображений с локальной LLM (LM Studio).
 
 Запуск:  python main.py
 Сборка:  build.bat  ->  dist/PIIMasker.exe
@@ -22,6 +22,7 @@ main.py — веб-сервис обезличивания PDF/Excel с лока
 import hashlib
 import hmac
 import json
+import base64
 import logging
 import math
 import os
@@ -31,9 +32,12 @@ import socket
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import date as date_cls, datetime as datetime_cls, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -59,6 +63,8 @@ KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 for d in (DATA_DIR, UPLOAD_DIR, OUTPUT_DIR, KNOWLEDGE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+IMAGE_EXTS = (".png", ".jpg", ".jpeg")
+
 SETTINGS_FILE = APP_DIR / "settings.json"
 USERS_FILE = DATA_DIR / "users.json"
 LOG_FILE = DATA_DIR / "activity.log"
@@ -71,10 +77,15 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "temperature": 0.0,
     "max_tokens": 4096,
     "request_timeout": 120,
+    # LM Studio загружает модель по требованию (JIT): первый запрос может ждать
+    # загрузку несколько минут.
+    "model_load_timeout": 600,
+    "llm_retries": 3,
     # 0 — ограничения нет: документ обрабатывается целиком, кусками.
     "max_llm_chars": 0,
     "llm_chunk_chars": 3500,
     "llm_enabled": True,
+    "ocr_lang": "rus+eng",
     "max_upload_mb": 50,
     "host": "0.0.0.0",
     "port": 9321,
@@ -83,9 +94,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "tray_minimize_on_close": True,
 }
 
+_LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 logging.basicConfig(
     filename=str(LOG_FILE), level=logging.INFO,
-    format="%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S", encoding="utf-8",
+    format=_LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S", encoding="utf-8",
 )
 logger = logging.getLogger("activity")
 
@@ -148,8 +160,18 @@ def _run_job(job_id: str, in_path: Path, out_path: Path, ext: str) -> None:
                         stage=stage, elapsed=round(time.time() - started, 1))
 
         try:
-            result = (process_pdf(in_path, out_path, progress=report) if ext == ".pdf"
-                      else process_excel(in_path, out_path, progress=report))
+            logger.info(f"PROCESS_START | job={job_id} | {in_path.name} | ext={ext}")
+            if ext == ".pdf":
+                result = process_pdf(in_path, out_path, progress=report)
+            elif ext in IMAGE_EXTS:
+                result = process_image(in_path, out_path, progress=report)
+            elif ext == ".docx":
+                result = process_docx(in_path, out_path, progress=report)
+            else:
+                result = process_excel(in_path, out_path, progress=report)
+            logger.info(f"PROCESS_DONE | job={job_id} | {in_path.name} | "
+                        f"{round(time.time() - started, 1)} s | "
+                        f"masked={result.get('masked')} | llm_used={result.get('llm_used')}")
         except Exception as e:
             logger.error(f"PROCESS_ERROR | job={job_id} | {in_path.name} | {e}")
             # Не оставляем недоделанный файл: при ошибке документ не выдаётся.
@@ -1401,15 +1423,119 @@ def get_llm(settings: Dict[str, Any] | None = None):
         return None
 
 
-def check_llm(settings: Dict[str, Any] | None = None) -> bool:
+def _lm_base_url(settings: Dict[str, Any]) -> str:
+    url = str(settings.get("lm_studio_url") or "").rstrip("/")
+    return re.sub(r"/v1$", "", url)
+
+
+def _lm_models(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Список моделей LM Studio. В native API есть state/type (загружена ли)."""
+    base = _lm_base_url(settings)
+    headers = {"Authorization": f"Bearer {settings.get('api_key', 'lm-studio')}"}
+    for path in ("/api/v0/models", "/v1/models", "/models"):
+        try:
+            req = urllib.request.Request(base + path, headers=headers)
+            with urllib.request.urlopen(req, timeout=3) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            items = data.get("data") if isinstance(data, dict) else data
+            if isinstance(items, list):
+                return [i for i in items if isinstance(i, dict)]
+        except Exception:
+            continue
+    return []
+
+
+def model_state(settings: Dict[str, Any] | None = None) -> Tuple[str, str]:
+    """(state, type) настроенной модели: loaded / not-loaded / unknown."""
     s = settings or load_settings()
-    url = s["lm_studio_url"].rstrip("/") + "/models"
-    try:
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {s.get('api_key', 'lm-studio')}"})
-        with urllib.request.urlopen(req, timeout=2) as r:
-            return 200 <= r.status < 300
-    except Exception:
+    wanted = str(s.get("model") or "").lower()
+    for item in _lm_models(s):
+        if str(item.get("id") or "").lower() == wanted:
+            return str(item.get("state") or "unknown"), str(item.get("type") or "")
+    return "unknown", ""
+
+
+def check_llm(settings: Dict[str, Any] | None = None) -> bool:
+    """Сервер доступен и нужная модель есть в списке LM Studio.
+
+    Модель может быть ещё не загружена: LM Studio загрузит её по первому
+    запросу (JIT), поэтому состояние loaded здесь не требуется.
+    """
+    s = settings or load_settings()
+    items = _lm_models(s)
+    if not items:
+        logger.warning(f"LLM недоступна: {s.get('lm_studio_url')}")
         return False
+    wanted = str(s.get("model") or "").lower()
+    if wanted and not any(str(i.get("id") or "").lower() == wanted for i in items):
+        logger.error(f"LLM: модель {s.get('model')} не найдена в LM Studio")
+        return False
+    return True
+
+
+def _try_lm_load(settings: Dict[str, Any]) -> None:
+    """Best-effort загрузка модели, если JIT в LM Studio выключен."""
+    base = _lm_base_url(settings)
+    model = str(settings.get("model") or "")
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {settings.get('api_key', 'lm-studio')}"}
+    for url, body in (
+        (f"{base}/api/v0/models/{urllib.parse.quote(model, safe='')}/load", {}),
+        (f"{base}/api/v0/models/load", {"model": model}),
+    ):
+        try:
+            req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                         method="POST", headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as r:
+                if 200 <= r.status < 300:
+                    logger.info(f"LLM: отправлена команда загрузки модели {model}")
+                    return
+        except Exception:
+            continue
+
+
+def warm_up_llm(settings: Dict[str, Any] | None = None, report: Any = None) -> bool:
+    """Дожидается загрузки модели по требованию и делает пробный запрос."""
+    s = settings or load_settings()
+    state, _ = model_state(s)
+    if state == "loaded":
+        return True
+    _try_lm_load(s)
+    timeout = max(30, int(s.get("model_load_timeout", 600) or 600))
+    llm_settings = {**s, "request_timeout": timeout}
+    llm = get_llm(llm_settings)
+    if llm is None:
+        return False
+    deadline = time.time() + timeout
+    attempt = 0
+    last = ""
+    while True:
+        attempt += 1
+        if report:
+            report(1, "Загрузка модели в LM Studio" if attempt == 1
+                   else f"Загрузка модели в LM Studio (попытка {attempt})")
+        try:
+            llm.invoke([("system", "Ответь одним словом."), ("human", "ping")])
+            logger.info(f"LLM готова: {s.get('model')} (попытка {attempt})")
+            return True
+        except Exception as e:
+            last = str(e)
+            logger.warning(f"LLM загрузка, попытка {attempt}: {last[:200]}")
+            if time.time() >= deadline:
+                logger.error(f"LLM не загрузилась за {timeout} с: {last[:300]}")
+                return False
+            time.sleep(min(15, 2 * attempt))
+
+
+def _is_model_loading_error(message: str) -> bool:
+    m = str(message or "").lower()
+    return any(k in m for k in ("loading", "not loaded", "no model", "model is not",
+                                "timed out", "timeout", "503", "connection", "refused"))
+
+
+def _prepare_llm(report: Any = None) -> None:
+    if not warm_up_llm(report=report):
+        raise RuntimeError("Модель в LM Studio не загрузилась — обработка отменена")
 
 
 ANON_SYSTEM = (
@@ -1646,7 +1772,8 @@ def anonymize_text(text: str,
             f"{chunk}"
         )
         raw = None
-        for _ in range(2):
+        retries = max(0, int(s.get("llm_retries", 3) or 0))
+        for attempt in range(2 + retries):
             try:
                 resp = llm.invoke([("system", ANON_SYSTEM), ("human", prompt)])
                 raw = resp.content if hasattr(resp, "content") else str(resp)
@@ -1654,6 +1781,10 @@ def anonymize_text(text: str,
             except Exception as e:
                 error = str(e)
                 logger.warning(f"LLM anonymize chunk {label}: {e}")
+                if not _is_model_loading_error(error) or attempt >= 1 + retries:
+                    break
+                # Модель могла выгрузиться или ещё грузиться: ждём и повторяем.
+                time.sleep(min(15, 3 * (attempt + 1)))
         if raw is None:
             # Сервер LLM недоступен: нет смысла ждать на каждом следующем куске.
             fatal = True
@@ -2830,6 +2961,412 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = (),
         wb.close()
     return {"masked": masked, "pages": 1, "preview_rows": preview}
 
+DOCX_PARTS = ("word/document.xml", "word/header", "word/footer",
+              "word/footnotes.xml", "word/endnotes.xml", "word/comments.xml",
+              "docProps/core.xml", "docProps/app.xml", "docProps/custom.xml")
+DOCX_PROPS = {"creator", "lastModifiedBy", "title", "subject", "description",
+              "keywords", "category", "company", "manager", "contentStatus"}
+
+
+def _register_docx_namespaces(raw: bytes) -> None:
+    try:
+        head = raw[:8000].decode("utf-8", "ignore")
+    except Exception:
+        return
+    for prefix, uri in re.findall(r'xmlns:([A-Za-z0-9_.-]+)="([^"]+)"', head):
+        if prefix.lower() in ("xml", "xmlns") or prefix.startswith("ns"):
+            continue
+        try:
+            ET.register_namespace(prefix, uri)
+        except Exception:
+            pass
+
+
+def _docx_own_runs(paragraph) -> List[Any]:
+    """w:t этого абзаца, без вложенных абзацев (текстовые поля/надписи)."""
+    tag = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    out: List[Any] = []
+
+    def walk(el) -> None:
+        for child in el:
+            if child.tag == tag + "p":
+                continue
+            if child.tag == tag + "t":
+                out.append(child)
+            else:
+                walk(child)
+
+    walk(paragraph)
+    return out
+
+
+def _docx_part_paragraphs(root) -> List[Any]:
+    tag = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    return [p for p in root.iter(tag + "p") if _docx_own_runs(p)]
+
+
+def _mask_docx_paragraph(paragraph, extras: Any, masker: Masker) -> bool:
+    runs = _docx_own_runs(paragraph)
+    texts = [r.text or "" for r in runs]
+    chars: List[str] = []
+    cmap: List[Tuple[int, int]] = []
+    for ri, text in enumerate(texts):
+        for oi, ch in enumerate(text):
+            if ch in _ZERO_WIDTH:
+                continue
+            chars.append(_norm_char(ch))
+            cmap.append((ri, oi))
+    joined = "".join(chars)
+    if not joined.strip():
+        return False
+    matches = iter_matches(joined, extras)
+    if not matches:
+        return False
+    edits: Dict[int, List[Tuple[int, int, str]]] = {}
+    for start, end, kind, value in matches:
+        pieces = _range_pieces(cmap, start, end)
+        if not pieces:
+            continue
+        fake = masker.get(kind, value)
+        originals = [texts[ri][a:b] for ri, a, b in pieces]
+        fakes = _distribute_fake(fake, originals)
+        for (ri, a, b), fp in zip(pieces, fakes):
+            if fp is not None:
+                edits.setdefault(ri, []).append((a, b, fp))
+    changed = False
+    for ri, items in edits.items():
+        text = texts[ri]
+        for a, b, fp in sorted(items, key=lambda x: -x[0]):
+            text = text[:a] + fp + text[b:]
+        if text != texts[ri]:
+            runs[ri].text = text
+            changed = True
+    return changed
+
+
+def _docx_parts(path: Path) -> List[str]:
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+    except Exception:
+        return []
+    return [n for n in names if any(n == p or n.startswith(p) for p in DOCX_PARTS)
+            and n.endswith(".xml")]
+
+
+def extract_docx_text(path: Path) -> str:
+    out: List[str] = []
+    try:
+        with zipfile.ZipFile(path) as z:
+            for name in _docx_parts(path):
+                raw = z.read(name)
+                _register_docx_namespaces(raw)
+                try:
+                    root = ET.fromstring(raw)
+                except Exception:
+                    continue
+                for p in _docx_part_paragraphs(root):
+                    text = "".join(t.text or "" for t in _docx_own_runs(p))
+                    if text.strip():
+                        out.append(text)
+    except Exception as e:
+        logger.warning(f"DOCX extract: {e}")
+    return "\n".join(out)
+
+
+def mask_docx_file(input_path: Path, output_path: Path, extras: Any = (),
+                   masker: Masker | None = None, progress: Any = None) -> Dict[str, Any]:
+    masker = masker or Masker()
+    parts = _docx_parts(input_path)
+    masked = 0
+    changed_parts: Dict[str, bytes] = {}
+    try:
+        with zipfile.ZipFile(input_path) as zin:
+            for index, name in enumerate(parts):
+                raw = zin.read(name)
+                _register_docx_namespaces(raw)
+                try:
+                    root = ET.fromstring(raw)
+                except Exception:
+                    continue
+                changed = False
+                for p in _docx_part_paragraphs(root):
+                    if _mask_docx_paragraph(p, extras, masker):
+                        masked += 1
+                        changed = True
+                if name.startswith("docProps/"):
+                    for el in root.iter():
+                        local = el.tag.rsplit("}", 1)[-1]
+                        if local in DOCX_PROPS and el.text:
+                            new = mask_text(el.text, extras, masker)
+                            if new != el.text:
+                                el.text = new
+                                masked += 1
+                                changed = True
+                if changed:
+                    changed_parts[name] = ET.tostring(root, encoding="UTF-8",
+                                                      xml_declaration=True)
+                if progress:
+                    progress(index + 1, len(parts))
+            with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = changed_parts.get(item.filename)
+                    zout.writestr(item, data if data is not None else zin.read(item.filename))
+    except Exception as e:
+        logger.error(f"DOCX mask: {e}")
+        raise
+    preview = extract_docx_text(output_path)[:1800]
+    return {"masked": masked, "pages": 1, "preview": preview}
+
+
+def process_docx(input_path: Path, output_path: Path,
+                 progress: Any = None) -> Dict[str, Any]:
+    def report(pct: int, stage: str) -> None:
+        if progress:
+            progress(max(0, min(99, int(pct))), stage)
+
+    report(1, "Извлечение текста")
+    text = extract_docx_text(input_path)
+    if not text.strip():
+        raise RuntimeError("В документе Word не найден текст для обезличивания")
+    report(3, "Загрузка модели")
+    _prepare_llm(report)
+    report(5, "Поиск персональных данных")
+    replacements, llm_ok, llm_error = anonymize_text(
+        text, _progress_callback(progress, 5, 67, "Обезличивание текста"))
+    if not llm_ok:
+        raise RuntimeError(_llm_failure_message(llm_error))
+    report(73, "Применение замен")
+    extras = _replacement_extras(replacements)
+    masker = _build_replacement_masker(replacements)
+    stats = mask_docx_file(
+        input_path, output_path, extras, masker=masker,
+        progress=_progress_callback(progress, 73, 24, "Правка документа"))
+    report(100, "Готово")
+    result: Dict[str, Any] = {"preview_type": "docx", **stats, "llm_used": llm_ok,
+                              "extras": [e["text"] for e in extras[:80]]}
+    if llm_error:
+        result["llm_error"] = llm_error[:300]
+    return result
+
+
+def _ocr_tesseract(path: Path) -> List[Dict[str, Any]]:
+    try:
+        import pytesseract
+        from PIL import Image
+        from pytesseract import Output
+    except Exception:
+        return []
+    s = load_settings()
+    try:
+        with Image.open(path) as img:
+            data = pytesseract.image_to_data(
+                img.convert("RGB"), lang=str(s.get("ocr_lang", "rus+eng")),
+                output_type=Output.DICT)
+    except Exception as e:
+        logger.warning(f"OCR tesseract: {e}")
+        return []
+    lines: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+    for i, text in enumerate(data.get("text", [])):
+        text = (text or "").strip()
+        if not text:
+            continue
+        try:
+            x, y = int(data["left"][i]), int(data["top"][i])
+            w, h = int(data["width"][i]), int(data["height"][i])
+        except Exception:
+            continue
+        key = (int(data["block_num"][i]), int(data["par_num"][i]),
+               int(data["line_num"][i]))
+        item = lines.get(key)
+        if item is None:
+            lines[key] = {"text": text, "box": [x, y, x + w, y + h]}
+        else:
+            item["text"] += " " + text
+            b = item["box"]
+            b[0], b[1] = min(b[0], x), min(b[1], y)
+            b[2], b[3] = max(b[2], x + w), max(b[3], y + h)
+    return list(lines.values())
+
+
+IMAGE_OCR_PROMPT = (
+    "Распознай весь текст на изображении документа и верни координаты строк. "
+    "Ответ — строго JSON без markdown:\n"
+    '{"lines":[{"text":"точный текст строки","box":[x0,y0,x1,y1]}]}\n'
+    "box — прямоугольник строки в координатах 0..1000 относительно ширины и "
+    "высоты изображения. Сохраняй порядок строк сверху вниз, не пропускай "
+    "таблицы, реквизиты, подписи и мелкий текст."
+)
+
+
+def _ocr_vision(path: Path) -> List[Dict[str, Any]]:
+    """OCR через мультимодальную модель LM Studio (если Tesseract недоступен)."""
+    s = load_settings()
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            width, height = img.size
+            img = img.convert("RGB")
+            img.thumbnail((2400, 2400))
+            tw, th = img.size
+            import io
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+    except Exception as e:
+        logger.warning(f"OCR image open: {e}")
+        return []
+    data_url = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    payload = {
+        "model": s.get("model"),
+        "temperature": 0,
+        "max_tokens": max(4096, int(s.get("max_tokens", 4096) or 4096)),
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": IMAGE_OCR_PROMPT},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }],
+    }
+    url = str(s.get("lm_studio_url") or "").rstrip("/") + "/chat/completions"
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"), method="POST",
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {s.get('api_key', 'lm-studio')}"})
+        timeout = max(60, int(s.get("model_load_timeout", 600) or 600))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = json.loads(r.read().decode("utf-8"))
+        content = raw["choices"][0]["message"]["content"]
+        parsed = _load_llm_json(content)
+    except Exception as e:
+        logger.warning(f"OCR vision: {e}")
+        return []
+    items = parsed.get("lines") if isinstance(parsed, dict) else parsed
+    if not isinstance(items, list):
+        logger.warning("OCR vision: нет JSON со строками")
+        return []
+    lines: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        box = item.get("box") or item.get("bbox")
+        if not text or not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        try:
+            x0, y0, x1, y1 = [float(v) for v in box]
+        except (TypeError, ValueError):
+            continue
+        if max(x0, x1, y0, y1) <= 1.5:
+            x0, x1, y0, y1 = x0 * width, x1 * width, y0 * height, y1 * height
+        elif max(x0, x1, y0, y1) <= 1005:
+            # Модель просили вернуть координаты 0..1000.
+            x0, x1 = x0 / 1000 * width, x1 / 1000 * width
+            y0, y1 = y0 / 1000 * height, y1 / 1000 * height
+        else:
+            # Координаты в пикселях уменьшенной копии.
+            x0, x1 = x0 * width / max(1, tw), x1 * width / max(1, tw)
+            y0, y1 = y0 * height / max(1, th), y1 * height / max(1, th)
+        x0, x1 = sorted((max(0, x0), min(width, x1)))
+        y0, y1 = sorted((max(0, y0), min(height, y1)))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            continue
+        lines.append({"text": text, "box": [x0, y0, x1, y1]})
+    if lines:
+        logger.info(f"OCR vision: {len(lines)} строк")
+    return lines
+
+
+def extract_image_text(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
+    lines = _ocr_tesseract(path)
+    if not lines:
+        lines = _ocr_vision(path)
+    return "\n".join(line["text"] for line in lines), lines
+
+
+def mask_image_file(input_path: Path, output_path: Path, lines: List[Dict[str, Any]],
+                    extras: Any = (), masker: Masker | None = None,
+                    progress: Any = None) -> Dict[str, Any]:
+    from PIL import Image, ImageDraw, ImageFont
+    masker = masker or Masker()
+    masked = 0
+    preview: List[str] = []
+    font_path = _font_path(False, False)
+    with Image.open(input_path) as src:
+        img = src.convert("RGB")
+    draw = ImageDraw.Draw(img)
+    total = max(1, len(lines))
+    for index, line in enumerate(lines):
+        text = str(line.get("text") or "")
+        new = mask_text(text, extras, masker)
+        preview.append(new)
+        if new != text:
+            x0, y0, x1, y1 = [int(round(v)) for v in line["box"]]
+            x0, y0 = max(0, x0), max(0, y0)
+            x1 = min(img.width, max(x1, x0 + 1))
+            y1 = min(img.height, max(y1, y0 + 1))
+            draw.rectangle([x0, y0, x1, y1], fill=(255, 255, 255))
+            # Фейковый текст той же строки, чтобы документ остался читаемым.
+            size = max(8, int((y1 - y0) * 0.8))
+            font = None
+            if font_path:
+                try:
+                    font = ImageFont.truetype(font_path, size)
+                except Exception:
+                    font = None
+            if font is not None:
+                try:
+                    while size > 7 and draw.textlength(new, font=font) > (x1 - x0):
+                        size -= 1
+                        font = ImageFont.truetype(font_path, size)
+                    draw.text((x0, y0), new, fill=(0, 0, 0), font=font)
+                except Exception:
+                    pass
+            masked += 1
+        if progress:
+            progress(index + 1, total)
+    suffix = output_path.suffix.lower()
+    if suffix in (".jpg", ".jpeg"):
+        img.save(output_path, format="JPEG", quality=95)
+    else:
+        img.save(output_path, format="PNG")
+    return {"masked": masked, "pages": 1, "preview": "\n".join(preview)[:1800]}
+
+
+def process_image(input_path: Path, output_path: Path,
+                  progress: Any = None) -> Dict[str, Any]:
+    def report(pct: int, stage: str) -> None:
+        if progress:
+            progress(max(0, min(99, int(pct))), stage)
+
+    report(1, "Распознавание текста")
+    report(2, "Загрузка модели")
+    _prepare_llm(report)
+    report(4, "Распознавание текста")
+    text, lines = extract_image_text(input_path)
+    if not lines or not text.strip():
+        raise RuntimeError("На изображении не найден текст. Установите Tesseract "
+                           "(rus+eng) или используйте мультимодальную модель LM Studio")
+    report(8, "Поиск персональных данных")
+    replacements, llm_ok, llm_error = anonymize_text(
+        text, _progress_callback(progress, 8, 64, "Обезличивание текста"))
+    if not llm_ok:
+        raise RuntimeError(_llm_failure_message(llm_error))
+    report(73, "Применение замен")
+    extras = _replacement_extras(replacements)
+    masker = _build_replacement_masker(replacements)
+    stats = mask_image_file(
+        input_path, output_path, lines, extras, masker=masker,
+        progress=_progress_callback(progress, 73, 24, "Перерисовка изображения"))
+    report(100, "Готово")
+    result: Dict[str, Any] = {"preview_type": "image", **stats, "llm_used": llm_ok,
+                              "extras": [e["text"] for e in extras[:80]]}
+    if llm_error:
+        result["llm_error"] = llm_error[:300]
+    return result
+
+
 def _progress_callback(progress: Any, start: int, span: int, stage: str):
     """Приводит прогресс обработки кусков/страниц к общему проценту."""
     def report(done: int, total: int) -> None:
@@ -2854,6 +3391,8 @@ def process_pdf(input_path: Path, output_path: Path,
         warning = "PDF похож на скан: часть страниц без текстового слоя. OCR не поддерживается — эти страницы не будут обезличены."
         logger.warning(f"PDF scan-like: {input_path.name}, text_pages_ratio={ratio:.2f}")
     text = extract_pdf_text(input_path)
+    report(3, "Загрузка модели")
+    _prepare_llm(report)
     report(5, "Поиск персональных данных")
     replacements, llm_ok, llm_error = anonymize_text(
         text, _progress_callback(progress, 5, 67, "Обезличивание текста"))
@@ -2896,6 +3435,8 @@ def process_excel(input_path: Path, output_path: Path,
 
     report(1, "Извлечение текста")
     text = extract_excel_text(input_path)
+    report(3, "Загрузка модели")
+    _prepare_llm(report)
     report(5, "Поиск персональных данных")
     replacements, llm_ok, llm_error = anonymize_text(
         text, _progress_callback(progress, 5, 67, "Обезличивание текста"))
@@ -2954,9 +3495,12 @@ def health():
     s = load_settings()
     if RETRIEVER is None:
         build_rag()
+    state, mtype = model_state(s)
     return {
         "ok": True,
         "model": s["model"],
+        "model_state": state,
+        "model_type": mtype,
         "lm_studio_url": s["lm_studio_url"],
         "llm_ok": check_llm(s),
         "rag": RETRIEVER is not None,
@@ -2977,13 +3521,15 @@ def process(file: UploadFile = File(...), user: str = Depends(get_current_user))
     if not s.get("llm_enabled", True):
         raise HTTPException(400, "LLM отключена — обезличивание невозможно")
     if not check_llm(s):
-        # Без LLM обрабатывать нечем: не принимаем файл и не создаём задание.
-        raise HTTPException(503, "LLM недоступна — загрузка не начата")
+        # Модель может быть не загружена — LM Studio загрузит её по первому
+        # запросу. Отказ только если сервер недоступен или модели нет в списке.
+        raise HTTPException(503, f"LM Studio недоступна или модель {s.get('model')} "
+                                 "не найдена — загрузка не начата")
     original = _safe_name(file.filename or "document")
     ext = Path(original).suffix.lower()
-    if ext not in (".pdf", ".xlsx"):
-        # Явный и понятный отказ, в т.ч. для .xls (старый формат openpyxl не читает).
-        raise HTTPException(400, "Поддерживаются только PDF и Excel (.xlsx)")
+    if ext not in (".pdf", ".xlsx", ".docx", *IMAGE_EXTS):
+        raise HTTPException(400, "Поддерживаются PDF, Word (.docx), Excel (.xlsx), "
+                                 "PNG и JPG")
 
     max_mb = int(s.get("max_upload_mb", 50))
     content = file.file.read(max_mb * 1024 * 1024 + 1)
@@ -3056,8 +3602,14 @@ def download(filename: str, user: str = Depends(get_current_user)):
         raise HTTPException(400, "Недопустимое имя файла")
     if not path.exists() or not path.is_file():
         raise HTTPException(404, "Файл не найден")
-    media = ("application/pdf" if name.lower().endswith(".pdf")
-             else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    media = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+    }.get(Path(name).suffix.lower(), "application/octet-stream")
     logger.info(f"DOWNLOAD | {user} | {name}")
     return FileResponse(path, media_type=media, filename=name)
 
@@ -3154,13 +3706,18 @@ class _NoConsoleStream:
 
 
 def _setup_file_logging() -> None:
+    root = logging.getLogger()
     try:
+        path = str(SERVER_LOG_FILE)
+        if any(getattr(h, "baseFilename", "") == path for h in root.handlers):
+            return
         fh = logging.FileHandler(SERVER_LOG_FILE, encoding="utf-8")
-        fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
-        logging.getLogger().addHandler(fh)
-        logging.getLogger().setLevel(logging.INFO)
-    except Exception:
-        pass
+        fh.setFormatter(logging.Formatter(_LOG_FORMAT))
+        root.addHandler(fh)
+        root.setLevel(logging.INFO)
+        logger.info(f"Логирование в файлы: {LOG_FILE.name}, {SERVER_LOG_FILE.name}")
+    except Exception as e:
+        logger.error(f"server.log: {e}")
 
 
 def _lan_ip() -> str:
@@ -3176,7 +3733,8 @@ def _lan_ip() -> str:
 
 def _run_uvicorn(host: str, port: int) -> None:
     import uvicorn
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    # log_config=None: uvicorn пишет в корневой логгер, т.е. в activity.log/server.log.
+    uvicorn.run(app, host=host, port=port, log_level="info", log_config=None)
 
 
 def run_server() -> None:
@@ -3190,11 +3748,14 @@ def run_server() -> None:
             sys.stdout = _NoConsoleStream()
         if sys.stderr is None:
             sys.stderr = _NoConsoleStream()
-        _setup_file_logging()
+    _setup_file_logging()
 
     s = load_settings()
     port = int(s.get("port", 9321))
     host = str(s.get("host", "0.0.0.0"))
+    logger.info(f"START | host={host} | port={port} | model={s.get('model')} | "
+                f"lm={s.get('lm_studio_url')} | llm_enabled={s.get('llm_enabled', True)}")
+    logger.info(f"LLM state: {model_state(s)}")
 
     if not frozen:
         print(f"Сайт: http://127.0.0.1:{port}  |  в сети: http://{_lan_ip()}:{port}")

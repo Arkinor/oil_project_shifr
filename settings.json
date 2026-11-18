@@ -5,9 +5,12 @@
   "temperature": 0.0,
   "max_tokens": 4096,
   "request_timeout": 120,
+  "model_load_timeout": 600,
+  "llm_retries": 3,
   "max_llm_chars": 0,
   "llm_chunk_chars": 3500,
   "llm_enabled": true,
+  "ocr_lang": "rus+eng",
   "host": "0.0.0.0",
   "port": 9321,
   "open_browser": true
