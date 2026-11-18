@@ -14,9 +14,9 @@ main.py — веб-сервис обезличивания PDF/Excel с лока
   POST /api/login            {login,password} -> {ok,login} | 401 "Неверный логин или пароль"
   GET  /api/me               (X-Login,X-Password) -> {login}
   GET  /api/health           -> {ok,model,lm_studio_url,llm_ok,rag,frozen,tray,users_count}
-  POST /api/process          multipart file     -> {ok,filename,download_name,download_url,
-                                                    elapsed,preview_type,preview,llm_used,extras,
-                                                    masked,pages}
+  POST /api/process          multipart file     -> {ok,job_id,filename,status,progress}
+  GET  /api/jobs             (X-Login,X-Password) -> {ok,jobs:[...]}
+  GET  /api/jobs/{job_id}    (X-Login,X-Password) -> {ok,status,progress,stage,...}
   GET  /api/download/{name}  (X-Login,X-Password) -> файл
 """
 import hashlib
@@ -35,6 +35,7 @@ import urllib.request
 import uuid
 import webbrowser
 from datetime import date as date_cls, datetime as datetime_cls, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -68,10 +69,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "model": "google/gemma-4-e2b",
     "api_key": "lm-studio",
     "temperature": 0.0,
-    "max_tokens": 2048,
+    "max_tokens": 4096,
     "request_timeout": 120,
-    "max_llm_chars": 30000,
-    "llm_chunk_chars": 4000,
+    # 0 — ограничения нет: документ обрабатывается целиком, кусками.
+    "max_llm_chars": 0,
+    "llm_chunk_chars": 3500,
     "llm_enabled": True,
     "max_upload_mb": 50,
     "host": "0.0.0.0",
@@ -91,6 +93,83 @@ logger = logging.getLogger("activity")
 # файлы последовательно, а этот замок страхует от параллельных запросов из
 # нескольких вкладок/клиентов.
 PROCESS_LOCK = threading.Lock()
+
+# Задания на обработку. Живут в памяти сервера, поэтому перезагрузка страницы
+# браузера не прерывает обработку: фронтенд просто переподключается к прогрессу.
+JOBS: Dict[str, Dict[str, Any]] = {}
+JOBS_LOCK = threading.Lock()
+JOB_RETENTION_SECONDS = 24 * 60 * 60
+
+
+def _prune_jobs() -> None:
+    cutoff = time.time() - JOB_RETENTION_SECONDS
+    with JOBS_LOCK:
+        for job_id, job in list(JOBS.items()):
+            if (job.get("status") in ("done", "error")
+                    and float(job.get("finished") or 0) < cutoff):
+                JOBS.pop(job_id, None)
+
+
+def _update_job(job_id: str, **fields: Any) -> None:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is not None:
+            job.update(fields)
+
+
+def _public_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    data = {
+        "id": job.get("id"),
+        "filename": job.get("filename"),
+        "size": job.get("size"),
+        "status": job.get("status"),
+        "progress": job.get("progress", 0),
+        "stage": job.get("stage", ""),
+        "elapsed": job.get("elapsed"),
+        "error": job.get("error", ""),
+        "created": job.get("created"),
+    }
+    if job.get("status") == "done" and isinstance(job.get("result"), dict):
+        data.update(job["result"])
+        data["download_name"] = job.get("download_name", "")
+        data["download_url"] = f"/api/download/{job.get('out_name', '')}"
+        data["filename"] = job.get("filename")
+    return data
+
+
+def _run_job(job_id: str, in_path: Path, out_path: Path, ext: str) -> None:
+    started = time.time()
+    with PROCESS_LOCK:
+        _update_job(job_id, status="processing", progress=1,
+                    stage="Подготовка документа", started=started)
+
+        def report(progress: int, stage: str) -> None:
+            _update_job(job_id, progress=max(0, min(99, int(progress))),
+                        stage=stage, elapsed=round(time.time() - started, 1))
+
+        try:
+            result = (process_pdf(in_path, out_path, progress=report) if ext == ".pdf"
+                      else process_excel(in_path, out_path, progress=report))
+        except Exception as e:
+            logger.error(f"PROCESS_ERROR | job={job_id} | {in_path.name} | {e}")
+            # Не оставляем недоделанный файл: при ошибке документ не выдаётся.
+            try:
+                out_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            _update_job(job_id, status="error", error=str(e), progress=0,
+                        stage="Ошибка", finished=time.time(),
+                        elapsed=round(time.time() - started, 1))
+        else:
+            _update_job(job_id, status="done", progress=100, stage="Готово",
+                        result=result, finished=time.time(),
+                        elapsed=round(time.time() - started, 1))
+        finally:
+            try:
+                in_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
 
 
 def ensure_settings() -> None:
@@ -205,83 +284,10 @@ ORG_FORM_RE = re.compile(
 ORG_ANY_RE = re.compile(
     rf"(?<![А-Яа-яЁёA-Za-z])(?:{LEGAL_FORMS}|{ORG_PREFIX_PATTERN})"
     rf"(?![А-Яа-яЁёA-Za-z])", re.I)
-QUOTED_NAME = r"[«\"][^»\"\n]{2,120}[»\"]"
-# После названия организации часто без запятой идут реквизиты; их подписи
-# не должны попадать в само название.
-ORG_NAME_STOP = (
-    r"(?i:(?:ИНН|КПП|ОГРН|ОГРНИП|БИК|СНИЛС|Адрес|Телефон|Факс|Email|E-mail|"
-    r"Р/с|К/с|Банк|Сумма|Итого|Всего|Дата|Срок|Подпись|Директор|Получатель|"
-    r"Плательщик)(?![А-Яа-яЁёA-Za-z]))")
-CAP_NAME = (rf"(?!{ORG_NAME_STOP})[А-ЯЁA-Z][\w\-]*"
-            rf"(?:\s+(?!{ORG_NAME_STOP})[А-ЯЁA-Z][\w\-]*){{0,7}}")
-ORG_VALUE_PATTERN = (
-    rf"(?i:{LEGAL_FORMS}|{ORG_PREFIX_PATTERN})\s*(?:{QUOTED_NAME}|{CAP_NAME})")
-BANK_VALUE_PATTERN = (
-    rf"(?:(?:(?:(?i:{ORG_PREFIX_PATTERN}))\s+(?:(?i:Банк))\s+|(?i:Банк)\s+)"
-    rf"(?:{QUOTED_NAME}|{CAP_NAME}))")
-BANK_AFTER_LABEL_PATTERN = (
-    rf"(?:(?:(?:(?i:{ORG_PREFIX_PATTERN}))\s+)?(?:(?:(?i:Банк))\s+)?"
-    rf"(?:{QUOTED_NAME}|{CAP_NAME}))")
 BANK_ANY_RE = re.compile(rf"(?<![А-Яа-яЁёA-Za-z])Банк(?![А-Яа-яЁёA-Za-z])", re.I)
 
-# Стороны договора: после этих подписей идёт наименование организации/ИП.
-PARTY_LABELS = (
-    r"Поставщик|Покупатель|Заказчик|Исполнитель|Подрядчик|Субподрядчик|Продавец|"
-    r"Арендодатель|Арендатор|Лицензиар|Лицензиат|Кредитор|За[её]мщик|Гарант|"
-    r"Принципал|Агент|Комитент|Комиссионер|Доверитель|Поверенный|Цедент|"
-    r"Цессионарий|Плательщик|Получатель|Грузоотправитель|Грузополучатель|"
-    r"Перевозчик|Экспедитор|Хранитель|Поклажедатель|Франчайзер|Франчайзи|"
-    r"Сторона\s*(?:№\s*)?[12]"
-)
-AMOUNT_LABELS = (
-    r"Сумм[аы](?:\s+(?:договора|платежа|платежей|оплаты|аванса))?|Цен[аы](?:\s+договора)?|"
-    r"Стоимост[ьи](?:\s+(?:договора|работ|услуг|товаров))?|Итого(?:\s+без\s+НДС)?|"
-    r"Всего(?:\s+без\s+НДС)?|Аванс|Оплата|Плат[её]ж|Вознаграждение|Штраф|Пеня|"
-    r"Неустойка|Задаток|Депозит"
-)
-AMOUNT_VALUE_PATTERN = (
-    r"((?:(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d+)(?:[.,]\d{1,2})?"
-    r"(?:\s*(?:руб\.?|рублей|р\.|₽|USD|EUR|€|долл\.?|евро))?"
-    r"(?:\s*\([^)\n]{1,200}\))?"
-    r"(?:\s*(?:руб\.?|рублей|р\.|₽|USD|EUR|€|долл\.?|евро))?"
-    r"(?:\s+\d{1,2}\s*коп\w*)?)"
-    r"|(?!(?:в|во|за|без|до|от|на|из|с|по|при|под|над|для|со)\s)"
-    r"(?:(?:[А-Яа-яЁё]+\s+){1,8}(?:руб\w*)(?:\s+\d{1,2}\s*коп\w*)?)"
-    r"|(?!(?:в|во|за|без|до|от|на|из|с|по|при|под|над|для|со)\s)"
-    r"(?:(?:[А-Яа-яЁё]+\s+){1,8}(?:коп\w*|долл\w*|евро|₽|USD|EUR)))"
-)
-TERM_LABELS = (
-    r"Сроки?(?:\s+(?:поставки|оплаты|выполнения(?:\s+работ)?|оказания\s+услуг|"
-    r"действия(?:\s+договора)?|годности|гарантии))?|Гарантийн\w*\s+срок|Гаранти[яи]|"
-    r"Периоды?(?:\s+(?:поставки|гарантии|действия))?|Срок\s+годности"
-)
 _MONTH_WORD = (r"(?:январ\w*|феврал\w*|март\w*|апрел\w*|ма[йя]\w*|июн\w*|июл\w*|"
                r"август\w*|сентябр\w*|октябр\w*|ноябр\w*|декабр\w*)")
-TERM_VALUE_PATTERN = (
-    rf"((?:\d{{1,2}}[./-]\d{{1,2}}[./-]\d{{2,4}}|\d{{4}}[./-]\d{{2}}[./-]\d{{2}})|"
-    rf"(?:\d{{1,2}}\s+{_MONTH_WORD}\s+\d{{4}}(?:\s*г\.?)?)|"
-    r"(?:(?:в\s+течение|не\s+позднее|не\s+менее|не\s+более|составляет)\s+)?"
-    r"(?:\d+\s*(?:\([^)\n]{1,200}\)\s*)?(?:календарн\w*\s+)?"
-    r"(?:дн\w*|недел\w*|месяц\w*|лет|год\w*))|"
-    r"(?:(?:[А-Яа-яЁё]+\s+){1,5}(?:календарн\w*\s+)?(?:дн\w*|недел\w*|месяц\w*|лет|год\w*)))"
-)
-ITEM_LABELS = (
-    r"Товар(?:ы|а|ов)?|Услуг[аи]|Работ[аы]|"
-    r"Наименование(?:\s+(?:товара|товаров|работ|работы|услуг|услуги))?|"
-    r"Предмет\s+договора|Номенклатура"
-)
-# Значение товара/работы/услуги: до запятой/точки с запятой или до следующей
-# подписи колонки, чтобы не съесть соседние ячейки таблицы.
-_ITEM_COLUMN_STOP = (
-    r"(?i:(?:Цена|Сумма|Стоимость|Количество|Кол-во|Ед|Единица|Итого|Всего|"
-    r"НДС|Код|Номер|Ставка|Скидка|Банк\w*|Организац\w*|Документ\w*|Показател\w*|"
-    r"Клиент\w*|Поставщик\w*|Покупател\w*|Получател\w*|Плательщик\w*|Договор\w*|"
-    r"Счет|Счёт)(?![А-Яа-яЁёA-Za-z]))")
-_ITEM_TOKEN = rf"(?!{_ITEM_COLUMN_STOP})[А-Яа-яЁёA-Za-z][\w\-]*"
-_ITEM_SEGMENT = rf"(?:{QUOTED_NAME}|{_ITEM_TOKEN}(?:\s+{_ITEM_TOKEN}){{0,7}})"
-# Товары/услуги часто перечислены через запятую или точку с запятой — прячем
-# весь список, иначе соседние позиции (в том числе со строчной буквы) остаются.
-ITEM_VALUE_PATTERN = rf"{_ITEM_SEGMENT}(?:\s*[,;]\s*{_ITEM_SEGMENT}){{0,5}}"
 
 
 # Числительные прописью: их тоже надо прятать, иначе сумма/срок остаются
@@ -312,150 +318,6 @@ _NUM_WORD_RE = re.compile(
     r"миллиарде|миллиарды|миллиардов|миллиардам|миллиардами|миллиардах"
     r")\b"
 )
-
-# Служебные слова, которые сами по себе не являются ПДн.
-STOP_VALUES = {
-    "договор", "акт", "счёт", "счет", "итого", "всего", "приложение", "сторона",
-    "стороны", "россия", "российская федерация", "рф", "город", "улица", "дом",
-    "квартира", "инн", "огрн", "огрнип", "кпп", "бик", "снилс", "паспорт",
-    "телефон", "адрес", "фио", "подпись", "директор", "бухгалтер", "организация",
-    "наименование", "дата", "номер", "подписант", "представитель", "заказчик",
-    "исполнитель", "покупатель", "продавец", "работник", "сотрудник", "клиент",
-    "ооо", "оао", "зао", "пао", "ао", "ип", "фгуп", "гуп", "муп", "гбу", "гау",
-    "ано", "нко", "фонд", "министерство", "департамент", "управление", "компания",
-    "г.", "ул.", "д.", "кв.", "обл.", "стр.", "корп.", "пр-т", "наб.", "ш.",
-    "место", "жительства", "нахождения", "регистрации", "почтовый",
-    # Роли сторон договора — это подписи полей, а не названия организаций.
-    "поставщик", "покупатель", "заказчик", "исполнитель", "подрядчик",
-    "субподрядчик", "продавец", "арендодатель", "арендатор", "лицензиар",
-    "лицензиат", "кредитор", "заёмщик", "заемщик", "гарант", "принципал",
-    "агент", "комитент", "комиссионер", "доверитель", "поверенный", "цедент",
-    "цессионарий", "плательщик", "получатель", "грузоотправитель",
-    "грузополучатель", "перевозчик", "экспедитор", "хранитель",
-    "поклажедатель", "франчайзер", "франчайзи", "сторона",
-    # Общие слова юридических форм без названия организации.
-    "общество", "ограниченной", "ответственностью", "дополнительной",
-    "акционерное", "публичное", "непубличное", "закрытое", "открытое",
-    "индивидуальный", "предприниматель", "унитарное", "предприятие",
-    "автономная", "некоммерческая", "государственное", "муниципальное",
-    "федеральное", "бюджетное", "казенное", "автономное", "учреждение",
-    "корпорация", "кооператив", "потребительский", "производственный",
-}
-
-# Слова-заголовки таблиц/анкет: три подряд таких слова — не ФИО и не организация.
-HEADER_WORDS = {
-    "фамилия", "имя", "отчество", "фио", "организация", "наименование",
-    "адрес", "телефон", "тел", "почта", "email", "инн", "огрн", "огрнип",
-    "кпп", "бик", "снилс", "паспорт", "дата", "номер", "сумма", "итого",
-    "всего", "должность", "подпись", "расшифровка", "примечание", "код",
-    "счет", "счёт", "банк", "получатель", "плательщик", "заказчик",
-    "исполнитель", "продавец", "покупатель", "сторона", "договор", "акт",
-    "приложение", "место", "жительства", "нахождения", "регистрации",
-    "почтовый", "индекс", "город", "улица", "дом", "квартира", "корпус",
-    "строение", "область", "район", "республика", "край", "поселок",
-    "село", "микрорайон", "проспект", "переулок", "набережная", "шоссе",
-    "бульвар", "площадь", "аллея", "тупик", "проезд", "литера", "офис",
-    "помещение", "здание", "этаж", "комната", "руководитель", "директор",
-    "бухгалтер", "главный", "менеджер", "специалист", "инженер", "начальник",
-    "отдел", "отделение", "филиал", "представительство", "сотрудник",
-    "работник", "клиент", "заемщик", "заёмщик", "страхователь", "пациент",
-    "ученик", "студент", "арендатор", "арендодатель", "ответственный",
-    "подписант", "представитель", "владелец", "гражданин", "гражданка",
-    "россия", "российская", "федерация", "рф",
-    "name", "first", "last", "surname", "middle", "full", "organization",
-    "company", "address", "phone", "email", "date", "number", "signature",
-    "position", "title", "code", "amount", "total", "note", "comments",
-    # Названия колонок/граф в таблицах и бланках (точные формы).
-    "услуга", "услуги", "услуг", "услугам", "товар", "товары", "товаров",
-    "назначение", "назначения", "цена", "цены", "цен", "стоимость",
-    "количество", "кол", "кол-во", "единица", "единицы", "единиц", "изм",
-    "измерение", "измерения", "ед", "шт", "раздел", "период", "основание",
-    "реквизиты", "валюта", "ставка", "процент", "стр", "строка", "пункт",
-    "лист", "страница", "формат", "тип", "статус", "серия", "месяц", "год",
-    "квартал", "день", "час", "документ", "вид", "характеристика",
-    "показатель", "свойство", "направление", "категория", "группа", "класс",
-    "подразделение", "согласование", "утверждение", "описание",
-    "того", "ндс", "скидка", "надбавка", "остаток", "расход", "приход",
-    # Стороны договора и юридические формы — подписи полей/общие термины.
-    "поставщик", "покупатель", "заказчик", "исполнитель", "подрядчик",
-    "субподрядчик", "продавец", "арендодатель", "арендатор", "лицензиар",
-    "лицензиат", "кредитор", "заёмщик", "заемщик", "гарант", "принципал",
-    "агент", "комитент", "комиссионер", "доверитель", "поверенный", "цедент",
-    "цессионарий", "плательщик", "получатель", "грузоотправитель",
-    "грузополучатель", "перевозчик", "экспедитор", "хранитель",
-    "поклажедатель", "франчайзер", "франчайзи", "сторона",
-    "общество", "ограниченной", "ответственностью", "дополнительной",
-    "акционерное", "публичное", "непубличное", "закрытое", "открытое",
-    "индивидуальный", "предприниматель", "унитарное", "предприятие",
-    "автономная", "некоммерческая", "государственное", "муниципальное",
-    "федеральное", "бюджетное", "казенное", "автономное", "учреждение",
-    "корпорация", "кооператив", "потребительский", "производственный",
-}
-
-# Основы служебных названий: слово считается заголовком, если начинается с
-# одной из них. Нужно для падежных форм («Товаров», «Услуг», «Назначению»),
-# которые точное сравнение с HEADER_WORDS не покрывает. Специально не включаем
-# основы, похожие на имена собственные/топонимы («остат» → Осташков,
-# «площад» → площадь Ленина, «тариф»/«позиц» → названия организаций).
-HEADER_STEMS = (
-    "услуг", "товар", "назначен", "стоимост", "количествен", "единиц",
-    "измерен", "номенклатур", "артикул", "описан", "характерист",
-    "категор", "подразделен", "реквизит", "контрагент", "наименован",
-    "показател", "примечан", "сведени", "данн", "значен",
-)
-
-# Служебные союзы/предлоги и буквы-маркеры внутри заголовка
-# («Цена за единицу», «Итого без НДС», «п/п», «н/д»).
-FIELD_FILLERS = {
-    "за", "по", "из", "в", "во", "на", "и", "без", "с", "от", "для", "к",
-    "под", "над", "или", "не", "п", "н", "д", "е", "у", "г",
-}
-
-
-def _is_header_like(value: str) -> bool:
-    s = str(value or "")
-    if re.search(r"\d", s):
-        return False
-    words = re.findall(r"[А-Яа-яЁёA-Za-z]+", s.lower())
-    return bool(words) and all(w in HEADER_WORDS for w in words)
-
-
-def _is_field_name(value: str) -> bool:
-    """Заголовок колонки/строки («Товары», «Назначение услуги», «Ед. изм.»).
-
-    Такой фрагмент — подпись поля, а не персональные данные: его замена ломает
-    структуру документа. Наличие цифры или слова вне служебного списка значит,
-    что это данные, и они по-прежнему маскируются.
-    """
-    s = str(value or "")
-    if re.search(r"\d", s):
-        return False
-    words = re.findall(r"[А-Яа-яЁёA-Za-z]+", s.lower())
-    if not words or len(words) > 4:
-        return False
-    for w in words:
-        if w in HEADER_WORDS or w in FIELD_FILLERS:
-            continue
-        if w.startswith(HEADER_STEMS):
-            continue
-        return False
-    return True
-
-
-_HEADER_SENSITIVE_KINDS = {"fio", "fio_initials", "fio_lat", "signature"}
-
-# Для этих типов значение — число/дата/сумма, поэтому проверки «похоже на
-# заголовок таблицы» неприменимы, а короткие совпадения (например, «1 год»)
-# тоже нужно маскировать.
-_DIGIT_KINDS = {"amount", "term", "number", "date", "birthdate", "index",
-                "house", "apartment", "inn", "ogrn", "ogrn_bare", "kpp",
-                "bik", "rs", "snils", "passport"}
-
-
-def _has_header_word(value: str) -> bool:
-    words = re.findall(r"[А-Яа-яЁёA-Za-z]+", str(value or "").lower())
-    return any(w in HEADER_WORDS for w in words)
-
 
 VALID_KINDS = {
     "fio", "fio_initials", "fio_lat", "surname", "name", "patronymic",
@@ -612,19 +474,36 @@ def _find_occurrences(text: str, value: str) -> List[re.Match]:
         return []
 
 
+@lru_cache(maxsize=4096)
+def _prefilter_needle(value: str) -> str:
+    """Самое длинное слово значения в нормализованном виде — быстрый отсев.
+
+    Гибкий шаблон меняет только пробелы, кавычки, тире, «ё» и точку, поэтому если
+    самого длинного слова нет в нормализованном тексте, совпадения быть не может.
+    Пустая строка означает «фильтровать нельзя» (слишком короткое слово).
+    """
+    tokens = re.findall(r"[0-9a-zа-я]+", _clean_value(value).lower().replace("ё", "е"))
+    if not tokens:
+        return ""
+    needle = max(tokens, key=len)
+    return needle if len(needle) >= 3 else ""
+
+
+def _prefilter_text(text: str) -> str:
+    """Текст в том же виде, что и слова из _prefilter_needle."""
+    return re.sub(r"[^0-9a-zа-я]+", " ", text.lower().replace("ё", "е"))
+
+
 def _is_bad_value(v: str) -> bool:
+    """Механическая проверка значения: длина, алфавит, маркер маски.
+
+    Никакой предметной логики здесь нет: что считать ПДн и что менять,
+    решает только LLM. Программа проверяет лишь пригодность строки для поиска.
+    """
     v = str(v or "").strip()
     if len(v) < 2 or len(v) > 300 or v == MASK:
         return True
-    if not re.search(r"[A-Za-zА-Яа-яЁё0-9]", v):
-        return True
-    # Модель иногда возвращает всю фразу преамбулы договора. Заменять её целиком
-    # нельзя: вместе с названием исчезнут слова «именуемое в дальнейшем…».
-    if re.search(r"(?i)именуем|в\s+дальнейшем|в\s+лице|действующ(?:ий|его|ая|ее)|"
-                 r"с\s+одной\s+стороны|с\s+другой\s+стороны", v):
-        return True
-    return (v.lower() in STOP_VALUES or _is_header_like(v)
-            or _is_field_name(v))
+    return not re.search(r"[A-Za-zА-Яа-яЁё0-9]", v)
 
 
 def _map_kind(kind: str) -> str:
@@ -632,141 +511,6 @@ def _map_kind(kind: str) -> str:
     if k in KIND_ALIASES:
         return KIND_ALIASES[k]
     return k if k in VALID_KINDS else ""
-
-
-# (тип, regex). Совпадение целиком заменяется похожим ненастоящим значением.
-# Регулярки — страховочная сеть для структурированных данных и явных маркеров;
-# основной поиск сущностей делает LLM (см. detect_pii_llm).
-PLAIN_PATTERNS: List[Tuple[str, re.Pattern]] = [
-    ("email", re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])")),
-    ("phone", re.compile(r"(?<!\d)(?:\+7|8)[\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}(?!\d)")),
-    ("passport", re.compile(r"(?<!\d)\d{2}\s?\d{2}(?:\s*(?:№|номер)\s*|\s+)\d{6}(?!\d)", re.I)),
-    ("snils", re.compile(r"(?<!\d)\d{3}[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{2}(?!\d)")),
-    ("kpp", re.compile(r"(?<!\d)\d{4}[A-ZА-Я]{2}\d{3}(?!\d)", re.I)),
-    # Метки («ИНН», «ОГРН», «БИК»...) не входят в совпадение — их сохраняет
-    # GROUP_PATTERNS, которые меняют только числовое значение.
-    ("inn", re.compile(r"(?<!\d)(?:\d{10}|\d{12})(?!\d)")),
-    ("ogrn", re.compile(r"(?<!\d)(?:\d{13}|\d{15})(?!\d)")),
-    ("bik", re.compile(r"(?<!\d)\d{9}(?!\d)")),
-    ("rs", re.compile(r"(?<!\d)\d{20}(?!\d)")),
-    # --- Организации: аббревиатура/полная юридическая форма + название ---
-    ("org", re.compile(
-        rf"(?<![А-Яа-яЁёA-Za-z]){ORG_VALUE_PATTERN}")),
-    # --- Наименование банка (реквизиты): «ПАО Банк «...»», «Банк ...» ---
-    ("bank", re.compile(
-        rf"(?<![А-Яа-яЁёA-Za-z]){BANK_VALUE_PATTERN}")),
-    # --- ФИО: обычный регистр, ВЕРХНИЙ РЕГИСТР, смешанный, инициалы ---
-    ("fio", re.compile(
-        r"(?<![А-Яа-яЁёA-Za-z])"
-        r"(?:[А-ЯЁ][а-яёА-ЯЁ-]{1,25}\s+){2}[А-ЯЁ][а-яёА-ЯЁ-]{1,25}"
-        r"(?![А-Яа-яЁёA-Za-z])")),
-    ("fio_initials", re.compile(
-        r"(?<![А-Яа-яЁёA-Za-z])[А-ЯЁ][а-яёА-ЯЁ-]{1,25}\s+[А-ЯЁ]\.\s?[А-ЯЁ]\."
-        r"(?![А-Яа-яЁёA-Za-z])")),
-    ("fio_initials", re.compile(
-        r"(?<![А-Яа-яЁёA-Za-z])[А-ЯЁ]\.\s?[А-ЯЁ]\.\s+[А-ЯЁ][а-яёА-ЯЁ-]{1,25}"
-        r"(?![А-Яа-яЁёA-Za-z])")),
-    ("fio_lat", re.compile(r"(?<![A-Za-z])(?:[A-Z][a-z]{1,20}\s+){2}[A-Z][a-z]{1,20}(?![A-Za-z])")),
-    # --- Адрес: только связки «маркер + значение», чтобы не съесть весь текст ---
-    ("address", re.compile(
-        r"(?<![А-Яа-яЁёA-Za-z])(?:"
-        r"(?:г\.|город|ул\.|улица|пр-т|проспект|пер\.|переулок|наб\.|набережная|"
-        r"ш\.|шоссе|д\.|дом|кв\.|квартира|корп\.|корпус|стр\.|строение|обл\.|область|"
-        r"респ\.|республика|п\.|пос\.|поселок|с\.|село|мкр\.|микрорайон)"
-        r"\s*[^\s,;]{1,40}"
-        r")(?:\s*,?\s*(?:"
-        r"г\.|город|ул\.|улица|пр-т|проспект|пер\.|переулок|наб\.|набережная|"
-        r"ш\.|шоссе|д\.|дом|кв\.|квартира|корп\.|корпус|стр\.|строение|обл\.|область|"
-        r"респ\.|республика|п\.|пос\.|поселок|с\.|село|мкр\.|микрорайон)"
-        r"\s*[^\s,;]{1,40}){0,5}")),
-    ("address_lat", re.compile(
-        r"(?<![A-Za-z])(?:st\.|street|ave\.|avenue|rd\.|road|blvd\.|boulevard|"
-        r"apt\.|apartment|suite|bldg\.|building|city|town)\s+[^\n,;]{1,60}"
-        r"(?:,\s*[^\n,;]{1,60}){0,3}", re.I)),
-    ("date", re.compile(r"(?<!\d)(?:\d{2}[./-]\d{2}[./-]\d{4}|\d{4}[./-]\d{2}[./-]\d{2})(?!\d)")),
-    ("date", re.compile(
-        rf"(?<!\d)\d{{1,2}}\s+{_MONTH_WORD}\s+\d{{4}}(?:\s*г\.?)?(?!\d)", re.I)),
-    ("number", re.compile(r"(?<![\d.,])-?(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d+)(?:[.,]\d+)?(?![\d])")),
-]
-
-# (тип, regex, номер группы). Меняется только значение, метка сохраняется.
-GROUP_PATTERNS: List[Tuple[str, re.Pattern, int]] = [
-    ("kpp", re.compile(r"(?:КПП)\s*[:\-]?\s*(\d{4}[0-9A-ZА-Я]{2}\d{3})", re.I), 1),
-    ("inn", re.compile(r"(?:ИНН)\s*[:\-]?\s*(\d{10,12})", re.I), 1),
-    ("ogrn", re.compile(r"(?:ОГРНИП|ОГРН)\s*[:\-]?\s*(\d{13,15})", re.I), 1),
-    ("bik", re.compile(r"(?:БИК)\s*[:\-]?\s*(\d{9})", re.I), 1),
-    ("rs", re.compile(r"(?:р\/с|к\/с|расч[её]тный\s*сч[её]т|корр?\.?\s*сч[её]т)\s*[:\-]?\s*(\d{20})", re.I), 1),
-    ("fio", re.compile(
-        r"(?:ФИО|Ф\.И\.О\.|Сотрудник|Работник|Владелец|Директор|Главный бухгалтер|"
-        r"Заемщик|Заёмщик|Клиент|Получатель|Представитель|Подписант|Страхователь|"
-        r"Пациент|Ученик|Студент|Арендатор|Арендодатель|Продавец|Покупатель|"
-        r"Исполнитель|Заказчик|Ответственный|Гражданин|Гражданка|Физлицо|"
-        r"Подпись|Расшифровка\s+подписи)\s*[:\-]?\s*"
-        r"([А-ЯЁ][А-ЯЁа-яё.\-]*(?:\s+[А-ЯЁ][А-ЯЁа-яё.\-]*){0,3})"), 1),
-    ("surname", re.compile(
-        r"(?:Фамилия)\s*[:\-]?\s*([А-ЯЁ][А-ЯЁа-яё\-]{1,40})", re.I), 1),
-    ("name", re.compile(
-        r"(?:Имя)\s*[:\-]?\s*([А-ЯЁ][А-ЯЁа-яё\-]{1,40})", re.I), 1),
-    ("patronymic", re.compile(
-        r"(?:Отчество)\s*[:\-]?\s*([А-ЯЁ][А-ЯЁа-яё\-]{1,40})", re.I), 1),
-    ("position", re.compile(
-        r"(?:Должность|Профессия)\s*[:\-]?\s*([А-ЯЁ][^\n;]{2,80})", re.I), 1),
-    ("fio_lat", re.compile(
-        r"(?:Name|Full\s*name|Director|Owner|Employee|Customer|Borrower|Client|"
-        r"Representative|Signatory)\s*[:\-]?\s*([A-Z][A-Za-z.\t -]{2,80})", re.I), 1),
-    ("org", re.compile(
-        rf"(?:{PARTY_LABELS}|Организация|Наименование|Работодатель|Компания|"
-        rf"Страхователь|Продавец|Покупатель|Исполнитель|Заказчик|Поставщик|"
-        rf"Подрядчик|Арендодатель|Арендатор|Лицензиар|Лицензиат|Кредитор|"
-        rf"За[её]мщик|Гарант|Принципал|Агент|Плательщик|Получатель|"
-        rf"Грузоотправитель|Грузополучатель|Перевозчик|Экспедитор)\s*[:\-]?\s*"
-        rf"({ORG_VALUE_PATTERN})", re.I), 1),
-    ("bank", re.compile(
-        rf"(?:Банк(?:\s+(?:получателя|плательщика))?|Наименование\s+банка|"
-        rf"Банк-эмитент)\s*[:\-]?\s*({BANK_AFTER_LABEL_PATTERN})", re.I), 1),
-    ("amount", re.compile(
-        rf"(?:{AMOUNT_LABELS})\s*[:\-]?\s*{AMOUNT_VALUE_PATTERN}", re.I), 1),
-    ("term", re.compile(
-        rf"(?:{TERM_LABELS})\s*[:\-]?\s*{TERM_VALUE_PATTERN}", re.I), 1),
-    ("item", re.compile(
-        rf"(?:{ITEM_LABELS})\s*[:\-]?\s*({ITEM_VALUE_PATTERN})", re.I), 1),
-    ("address", re.compile(
-        r"(?:Адрес|Место жительства|Место нахождения|Почтовый адрес|Место регистрации|"
-        r"Address)\s*[:\-]?\s*([^\n;]{5,150})", re.I), 1),
-    ("city", re.compile(
-        r"(?:Город|Населённый\s+пункт|Населенный\s+пункт)\s*[:\-]?\s*"
-        r"([А-ЯЁ][^\n;,]{1,60})", re.I), 1),
-    ("street", re.compile(
-        r"(?:Улица|Проспект|Переулок|Набережная|Шоссе|Бульвар|Площадь|Аллея|"
-        r"Проезд|Тупик)\s*[:\-]?\s*([А-ЯЁ][^\n;,]{1,60})", re.I), 1),
-    ("house", re.compile(
-        r"(?:Дом|Корпус|Строение|Здание)\s*[:\-]?\s*([0-9][^\n;,]{0,20})", re.I), 1),
-    ("apartment", re.compile(
-        r"(?:Квартира|Офис|Помещение|Комната)\s*[:\-]?\s*"
-        r"([0-9][^\n;,]{0,20})", re.I), 1),
-    ("index", re.compile(
-        r"(?:Почтовый\s+индекс|Индекс)\s*[:\-]?\s*(\d{6})", re.I), 1),
-    ("birthdate", re.compile(
-        r"(?:Дата\s+рождения|Д\.\s?р\.)\s*[:\-]?\s*"
-        r"(\d{2}[./-]\d{2}[./-]\d{4}|\d{4}[./-]\d{2}[./-]\d{2})", re.I), 1),
-]
-
-PRIORITY = {
-    "email": 10, "phone": 10,
-    "passport": 9, "snils": 9, "kpp": 9, "inn": 9, "ogrn": 9, "ogrn_bare": 9,
-    "bik": 9, "rs": 9,
-    "date": 8, "birthdate": 8,
-    "fio": 7, "fio_initials": 7, "fio_lat": 7, "surname": 7, "name": 7, "patronymic": 7,
-    "org": 7, "org_name": 7, "abbr": 7,
-    "bank": 9, "amount": 8, "term": 8, "item": 6,
-    "address": 7, "address_lat": 7, "city": 7, "street": 7, "house": 7,
-    "apartment": 7, "index": 7, "position": 7, "signature": 7,
-    "number": 1, "extra": 5,
-}
-EXTRA_PRIORITY = 11  # целые сущности от LLM важнее регулярных догадок
-COMPONENT_KINDS = {"surname", "name", "patronymic", "fio_initials", "org_name",
-                   "city", "street", "house", "apartment", "index", "abbr", "position",
-                   "amount", "term", "item"}
 
 
 def _mix_letters(text: str, rate: float = 0.08) -> str:
@@ -897,22 +641,128 @@ def _apply_case(fake: str, original: str) -> str:
     return fake
 
 
+_QUOTE_PAIRS = (("«", "»"), ("“", "”"), ('"', '"'), ("'", "'"))
+
+
+def _is_quoted(value: str) -> bool:
+    return len(value) >= 2 and any(
+        value.startswith(left) and value.endswith(right) for left, right in _QUOTE_PAIRS)
+
+
+def _match_quotes(fake: str, original: str) -> str:
+    """Сохраняет кавычки исходника: «Ромашка» -> «Лютик», а не «Лютик» без кавычек."""
+    fake = str(fake or "")
+    original = str(original or "").strip()
+    if not fake or _is_quoted(fake):
+        return fake
+    for left, right in _QUOTE_PAIRS:
+        if original.startswith(left) and original.endswith(right) and len(original) >= 2:
+            return f"{left}{fake}{right}"
+    return fake
+
+
 class Masker:
     """Генерирует и запоминает фейковые значения в рамках одного документа."""
 
     def __init__(self):
         self.fake = Faker("ru_RU")
         self.cache: Dict[Tuple[str, str], str] = {}
+        # Точные замены, которые предложила LLM: исходный фрагмент -> готовое
+        # значение. Ключ без учёта регистра, чтобы одно и то же значение
+        # заменялось одинаково во всех частях документа.
+        self.exact: Dict[str, str] = {}
         self.item_seq = 0
+
+    def _remember(self, kind: str, original: str, fake: str) -> None:
+        original = str(original or "").strip()
+        fake = str(fake or "").strip()
+        if not original or not fake:
+            return
+        key = original.lower()
+        self.cache[(kind, key)] = fake
+        self.exact[key] = fake
+
+    def set_exact(self, original: str, fake: str, kind: str = "") -> None:
+        """Запоминает готовую замену от LLM и её составные части.
+
+        Благодаря этому «Иванов Иван Иванович» -> «Петров Пётр Петрович»
+        даёт согласованные «Петров» и «Петров П.П.» в остальных местах,
+        а «ООО «Ромашка»» -> «ООО «Лютик»» — тот же бренд без кавычек.
+        """
+        original = str(original or "").strip()
+        fake = str(fake or "").strip()
+        if not original or not fake:
+            return
+        kind = _map_kind(kind) or _infer_kind(original)
+        self._remember(kind, original, fake)
+
+        cleared_original = _clean_value(original)
+        cleared_fake = _clean_value(fake)
+        if cleared_original and cleared_original != original:
+            self._remember(kind, cleared_original, cleared_fake or fake)
+
+        inner_original = original.strip(" «»\"'“”")
+        inner_fake = fake.strip(" «»\"'“”")
+        if inner_original and inner_original != original and inner_fake:
+            self._remember(kind, inner_original, inner_fake)
+
+        base_original = cleared_original or original
+        base_fake = cleared_fake or fake
+        if kind in ("fio", "signature"):
+            originals = self._fio_parts(base_original)
+            fakes = re.findall(r"[А-ЯЁA-Z][а-яёa-z\-]+", base_fake)
+            if len(originals) >= 3 and len(fakes) >= 3:
+                for component, src, dst in (
+                        ("surname", originals[0], fakes[0]),
+                        ("name", originals[1], fakes[1]),
+                        ("patronymic", originals[2], fakes[2])):
+                    self._remember(component, src, dst)
+        elif kind in ("org", "org_name"):
+            _, original_rest = _split_org(base_original)
+            _, fake_rest = _split_org(base_fake)
+            original_brand = (re.findall(r"[«\"]([^»\"]{2,120})[»\"]", original_rest)
+                              or [original_rest])[0]
+            fake_brand = (re.findall(r"[«\"]([^»\"]{2,120})[»\"]", fake_rest)
+                          or [fake_rest])[0]
+            if original_brand and fake_brand:
+                self._remember("org_name", original_brand, fake_brand)
+        elif kind in ("address", "address_lat"):
+            address_parts = (
+                ("city", r"(?:г\.|город|city|town)\s*([А-ЯЁA-Z][\w\-]+)"),
+                ("street", r"(?:ул\.|улица|пр-т|проспект|пер\.|переулок|наб\.|"
+                           r"набережная|ш\.|шоссе|street|st\.|avenue|ave\.|road|rd\.)\s*"
+                           r"([А-ЯЁA-Z][\w\-]+)"),
+                ("house", r"(?:д\.|дом|корп\.|корпус|стр\.|строение|building|bldg\.)\s*"
+                          r"([0-9][\w\-/]*)"),
+                ("apartment", r"(?:кв\.|квартира|офис|помещение|apt\.|suite)\s*"
+                              r"([0-9][\w\-/]*)"),
+                ("index", r"(?:индекс|postal\s+code|zip)\s*(\d{6})"),
+            )
+            for component, pattern in address_parts:
+                original_match = re.search(pattern, base_original, re.I)
+                fake_match = re.search(pattern, base_fake, re.I)
+                if original_match and fake_match:
+                    self._remember(component, original_match.group(1), fake_match.group(1))
 
     def get(self, kind: str, original: str) -> str:
         kind = _map_kind(kind) or _infer_kind(original)
         original = str(original or "")
+        exact = None
+        for candidate in (original.strip().lower(),
+                          _clean_value(original).lower(),
+                          original.strip(" «»\"'“”").lower()):
+            if candidate and candidate in self.exact:
+                exact = self.exact[candidate]
+                break
+        if exact:
+            if re.search(r"[А-Яа-яЁёA-Za-z]", original):
+                return _match_quotes(_apply_case(exact, original), original)
+            return exact
         base = self._component(kind, original)
         if kind == "item":
             # «Позиция 1» — нейтральный маркер, регистр исходного названия не копируем.
-            return base
-        return _apply_case(base, original)
+            return _match_quotes(base, original)
+        return _match_quotes(_apply_case(base, original), original)
 
     def _component(self, kind: str, original: str) -> str:
         key = (kind, str(original or "").lower())
@@ -1090,6 +940,13 @@ class Masker:
         if kind == "fio":
             toks = self._fio_parts(original)
             if len(toks) >= 3:
+                # Если LLM уже задала замену для фамилии/имени/отчества,
+                # используем её, чтобы ФИО было согласовано во всём документе.
+                if any(t.lower() in self.exact for t in toks[:3]):
+                    s = self._component("surname", toks[0])
+                    n = self._component("name", toks[1])
+                    p = self._component("patronymic", toks[2])
+                    return f"{s} {n} {p}"
                 # Согласуем фейковые ФИО по полу: иначе имя, отчество и фамилия
                 # выглядят как ошибка и мешают читать обезличенный документ.
                 female = bool(re.search(r"(?i)(?:[вчш]на|[вчш]ны|[вчш]не|[вчш]ну)$", toks[2]))
@@ -1103,7 +960,7 @@ class Masker:
                     p = self.fake.middle_name_male()
                 return f"{s} {n} {p}"
             if len(toks) == 2:
-                return f"{self._component('surname', toks[0])} {self._component('name', toks[1])}"
+                return f"{self._component1('surname', toks[0])} {self._component('name', toks[1])}"
             return self._component("fio", self.fake.name())
         if kind == "surname":
             return _mix_letters(self.fake.last_name(), 0.06)
@@ -1339,65 +1196,42 @@ def _iter_extras(extras: Any):
             yield v, k
 
 
-def _add_candidate(cands: List[Tuple[int, int, str, str, int]], start: int, end: int,
-                   kind: str, raw: str, priority: int | None = None) -> None:
-    left = len(raw) - len(raw.lstrip())
-    right = len(raw) - len(raw.rstrip())
-    start += left
-    end -= right
-    value = raw.strip()
-    # Название колонки/строки шапки («Наименование Товаров Цена» часто склеивается
-    # регуляркой в одно ФИО/организацию) — служебный текст, менять его нельзя.
-    if (end - start >= 2 or kind in _DIGIT_KINDS) and (
-            kind in _DIGIT_KINDS
-            or (not _is_header_like(value) and not _is_field_name(value))):
-        # Заголовок таблицы, склеенный со значением,
-        # не должен превращаться в ФИО/организацию.
-        if kind in _HEADER_SENSITIVE_KINDS and _has_header_word(value):
-            return
-        prio = PRIORITY.get(kind, 0) if priority is None else priority
-        cands.append((start, end, kind, value, prio))
-
-
 def iter_matches(text: str, extras: Any = ()) -> List[Tuple[int, int, str, str]]:
-    """Возвращает непересекающиеся совпадения (start, end, тип, значение).
+    """Возвращает совпадения (start, end, тип, значение) по списку замен LLM.
 
-    Позиции — в исходной строке. Приоритет у сущностей от LLM: они выбираются
-    первыми, регулярки добирают только то, что ИИ не назвал.
+    Никаких регулярных шаблонов и словарей предметной области: что менять,
+    решает модель. Программа лишь находит указанные ею строки в тексте.
     """
     if not isinstance(text, str) or not text:
         return []
     norm, idx = _normalize_with_map(text)
-    cands: List[Tuple[int, int, str, str, int]] = []
-    for kind, rx, group in GROUP_PATTERNS:
-        for m in rx.finditer(norm):
-            _add_candidate(cands, m.start(group), m.end(group), kind, m.group(group))
-    for kind, rx in PLAIN_PATTERNS:
-        for m in rx.finditer(norm):
-            _add_candidate(cands, m.start(), m.end(), kind, m.group(0))
+    haystack = _prefilter_text(norm)
+    cands: List[Tuple[int, int, str, str]] = []
     for value, raw_kind in _iter_extras(extras):
+        needle = _prefilter_needle(value)
+        if needle and needle not in haystack:
+            continue
         kind = _map_kind(raw_kind) or _infer_kind(value)
-        # части ФИО/адреса не должны перебивать более длинную целую сущность
-        prio = PRIORITY.get(kind, 7) if kind in COMPONENT_KINDS else EXTRA_PRIORITY
         for m in _find_occurrences(norm, value):
-            _add_candidate(cands, m.start(), m.end(), kind, m.group(0), prio)
-    best: Dict[Tuple[int, int], Tuple[int, int, str, str, int]] = {}
+            # Берём реальный срез текста: в нём могут быть кавычки/метка,
+            # которые Masker вернёт в замену (_match_quotes), а точную пару
+            # он найдёт по очищенному ключу.
+            cands.append((m.start(), m.end(), kind, m.group(0)))
+    # Одинаковые диапазоны схлопываем; при пересечении побеждает более длинное
+    # значение: «Иванов Иван Иванович» важнее отдельной «Иванов».
+    best: Dict[Tuple[int, int], Tuple[int, int, str, str]] = {}
     for c in cands:
-        key = (c[0], c[1])
-        prev = best.get(key)
-        if prev is None or c[4] > prev[4]:
-            best[key] = c
-    selected: List[Tuple[int, int, str, str, int]] = []
-    for c in sorted(best.values(), key=lambda x: (-x[4], -(x[1] - x[0]), x[0])):
-        if all(c[1] <= s or c[0] >= e for s, e, _, _, _ in selected):
+        best.setdefault((c[0], c[1]), c)
+    selected: List[Tuple[int, int, str, str]] = []
+    for c in sorted(best.values(), key=lambda x: (-(x[1] - x[0]), x[0])):
+        if all(c[1] <= s or c[0] >= e for s, e, _, _ in selected):
             selected.append(c)
     selected.sort(key=lambda x: x[0])
     result: List[Tuple[int, int, str, str]] = []
-    for s, e, kind, value, _ in selected:
+    for s, e, kind, value in selected:
         if s >= len(idx) or e - 1 >= len(idx):
             continue
-        os_, oe = idx[s], idx[e - 1] + 1
-        result.append((os_, oe, kind, value))
+        result.append((idx[s], idx[e - 1] + 1, kind, value))
     return result
 
 
@@ -1578,275 +1412,334 @@ def check_llm(settings: Dict[str, Any] | None = None) -> bool:
         return False
 
 
-def _parse_json_array(raw: str) -> List[Any]:
-    raw = raw or ""
-    cleaned = re.sub(r",\s*([\]}])", r"\1", raw)
-    for candidate in (cleaned, raw):
-        m = re.search(r"\[[\s\S]*\]", candidate)
-        if m:
-            try:
-                data = json.loads(m.group(0))
-                if isinstance(data, list):
-                    return data
-            except Exception:
-                pass
-        m = re.search(r"\{[\s\S]*\}", candidate)
-        if m:
-            try:
-                data = json.loads(m.group(0))
-                for key in ("items", "values", "pii", "result", "entities", "data"):
-                    if isinstance(data.get(key), list):
-                        return data[key]
-            except Exception:
-                pass
-    # ответ невалидный JSON — вытаскиваем объекты и строки по отдельности
-    objs = re.findall(r"\{[^{}]{0,500}\}", raw)
-    if objs:
-        out = []
-        for o in objs:
-            try:
-                out.append(json.loads(o))
-            except Exception:
-                pass
-        if out:
-            return out
-    quoted = re.findall(r'"([^"\n]{3,200})"', raw)
-    if quoted:
-        return quoted
-    return [ln.strip(" -•\t") for ln in raw.splitlines() if 3 <= len(ln.strip(" -•\t")) <= 200]
-
-
-LLM_SYSTEM = (
-    "Ты — эксперт по обезличиванию документов. Найди в тексте ВСЕ фрагменты, которые "
-    "позволяют идентифицировать человека, организацию или объект, и верни их ДОСЛОВНО, "
-    "символ в символ, как в тексте.\n"
-    "Что искать: ФИО полностью и по частям (фамилия, имя, отчество, инициалы); названия "
-    "организаций (полные, краткие, аббревиатуры, бренды), в том числе «Общество с "
-    "ограниченной ответственностью ...», «Акционерное общество ...», «Публичное "
-    "акционерное общество ...», «Индивидуальный предприниматель ...»; должности и подписи; "
-    "адреса полностью и по частям (город, улица, дом, корпус, квартира, индекс); телефоны, "
-    "email; паспорт, СНИЛС, ИНН, ОГРН/ОГРНИП, КПП, БИК, расчётные и корреспондентские "
-    "счета; наименования банков; даты рождения.\n"
-    "Обязательно ищи стороны договора после подписей «Поставщик», «Покупатель», "
-    "«Заказчик», «Исполнитель», «Подрядчик», «Арендодатель», «Арендатор», «Продавец», "
-    "«Лицензиар», «Лицензиат», «Кредитор», «Заёмщик», «Гарант», «Плательщик», "
-    "«Получатель», «Сторона 1», «Сторона 2» и аналогичных — это названия организаций/ИП.\n"
-    "Где искать: стороны — в преамбуле (после «именуемое в дальнейшем») и в блоке "
-    "реквизитов; банк, счета и БИК — в реквизитах; суммы, цены, аванс, штрафы — в "
-    "разделе о цене, в таблицах и в назначении платежа; сроки и гарантии — в разделах "
-    "о сроках, поставке и гарантиях; товары, работы, услуги — в спецификации, смете, "
-    "перечне или табличной части.\n"
-    "Также ищи существенные условия договора: суммы и цены платежей, размер аванса, "
-    "штрафы, пени, неустойки (тип amount); сроки поставки, оплаты, гарантии и "
-    "гарантийные сроки (тип term); наименования товаров, работ и услуг — конкретные "
-    "значения, а не заголовки «Товар», «Работа», «Услуга» (тип item).\n"
-    "Суммы и сроки возвращай целиком, как в тексте, вместе с валютой и единицей "
-    "измерения. Для банка возвращай наименование банка "
-    "(тип bank), для товара/работы/услуги — конкретное наименование (тип item).\n"
-    "Ищи в любом оформлении: ЖИРНЫЙ, курсив, подчёркивание, ВЕРХНИЙ РЕГИСТР, разряженный "
-    "текст, в кавычках, в таблицах, в реквизитах и в блоках электронной подписи.\n"
-    "Если одно и то же название встречается в разных написаниях — верни каждое написание "
-    "отдельно. Если сущность разбита переносом строки или колонками таблицы — верни её "
-    "целиком одной строкой (пробелы между словами).\n"
-    "Менять можно ТОЛЬКО ЗНАЧЕНИЯ полей, а не их подписи. НИКОГДА не возвращай "
-    "заголовки колонок, граф, строк и разделов, названия полей и общие термины: "
-    "«Договор», «Акт», «Стороны», «Приложение», «ИНН», «КПП», «Адрес», «Подпись», "
-    "«Услуги», «Товары», «Назначение», «Наименование», «Количество», «Ед. изм.», "
-    "«Цена», «Стоимость», «Сумма», «Итого», «Всего», «Дата», «Номер», «Код», "
-    "«Период», «Основание», «Категория», «Подразделение», «Реквизиты», «Статус», "
-    "«Показатель», «Характеристика», «Описание», № п/п. Замена такого текста ломает "
-    "структуру документа.\n"
-    "Заголовок и значение — разные фрагменты: если в шапке таблицы написано «Услуга», "
-    "а в строке данных «Консультация аудитора», меняй только «Консультация аудитора».\n"
-    "Не придумывай значений, которых нет в тексте. Если сущности нет — верни []. "
-    "Ответ — ТОЛЬКО JSON-массив объектов "
-    'вида [{"text":"...","type":"..."}], без markdown и пояснений.'
-)
-
-LLM_TYPES = (
-    "type: fio | fio_initials | surname | name | patronymic | org | org_name | bank | "
-    "amount | term | item | abbr | address | city | street | house | apartment | index | "
-    "position | signature | email | phone | inn | ogrn | kpp | bik | rs | snils | "
-    "passport | birthdate | date | number | other"
+ANON_SYSTEM = (
+    "Ты — система обезличивания документов. Тебе дают фрагмент текста. "
+    "Твоя задача — найти в нём персональные и конфиденциальные данные и "
+    "вернуть СПИСОК ЗАМЕН в JSON.\n"
+    "Формат ответа — строго один JSON-объект:\n"
+    '{"replacements":[{"original":"точная подстрока из фрагмента",'
+    '"replacement":"вымышленное значение","type":"тип"}]}\n'
+    "Правила:\n"
+    "1. original — подстрока фрагмента символ в символ, без изменений. "
+    "Одно значение указывай один раз: программа заменит все его вхождения.\n"
+    "2. replacement — правдоподобное вымышленное значение того же формата: "
+    "длина и вид чисел, разделители, валюта, единицы измерения, кавычки, регистр.\n"
+    "3. type — одно из: fio, fio_initials, fio_lat, surname, name, patronymic, "
+    "org, org_name, abbr, address, address_lat, city, street, house, apartment, "
+    "index, phone, email, passport, snils, inn, ogrn, kpp, bik, rs, bank, "
+    "amount, term, item, position, signature, date, extra.\n"
+    "4. Меняй ТОЛЬКО значения: ФИО полностью и по частям, инициалы; названия "
+    "организаций (полные, краткие, бренды, аббревиатуры), ИП; адреса и их части; "
+    "телефоны, email; паспорт, СНИЛС, ИНН, ОГРН/ОГРНИП, КПП, БИК, счета; "
+    "названия банков; суммы, цены, авансы, штрафы, пени; сроки и гарантии; "
+    "конкретные наименования товаров, работ и услуг; должности и подписи.\n"
+    "5. НЕ включай в replacements заголовки разделов и абзацев, названия таблиц, "
+    "заголовки колонок и граф, подписи полей, служебные слова, нумерацию и даты "
+    "документа. Например, «Услуги», «Товары», «Назначение», «Наименование», "
+    "«Количество», «Ед. изм.», «Цена», «Стоимость», «Сумма», «Итого», «Всего», "
+    "«Дата», «Номер», «Код», «Период», «Основание», «Категория», «Реквизиты», "
+    "«Подпись», «ИНН», «КПП», «Адрес» — это подписи, их менять нельзя.\n"
+    "6. Включи ВСЕ встречающиеся варианты: полное ФИО, фамилию отдельно, "
+    "инициалы; полное и краткое название организации, бренд; адрес целиком и "
+    "отдельные части; сумму цифрами и прописью, если обе есть.\n"
+    "7. original должен быть достаточно длинным и однозначным, чтобы не "
+    "совпасть в другом смысле: добавляй контекст («д. 5», «ИНН 7701234567»), "
+    "но не захватывай саму подпись поля. Не указывай отдельные цифры и буквы.\n"
+    "8. Экранируй кавычки и переводы строк по правилам JSON.\n"
+    "Если менять нечего — верни {\"replacements\": []}. "
+    "Ответ — только JSON, без markdown и пояснений."
 )
 
 
-def _chunk_text(text: str, size: int, overlap: int) -> List[str]:
+def _split_text_chunks(text: str, size: int) -> List[str]:
+    """Режет текст на куски по абзацам/строкам/предложениям, сохраняя символы.
+
+    Куски не пересекаются: итоговая сумма кусков равна исходному тексту, поэтому
+    замены можно точно сопоставить с документом.
+    """
+    size = max(800, int(size or 3500))
+    if not text:
+        return []
     if len(text) <= size:
         return [text]
-    step = max(1, size - overlap)
-    chunks = []
-    for i in range(0, len(text), step):
-        chunk = text[i:i + size]
-        if chunk.strip():
+    chunks: List[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        end = min(n, i + size)
+        if end < n:
+            window_start = i + max(1, int(size * 0.45))
+            boundary = -1
+            # Сначала абзац, затем строка, затем предложение, затем пробел.
+            for pattern in (r"\n[ \t]*\n", r"\n", r"(?<=[.!?;])\s+"):
+                found = list(re.finditer(pattern, text[window_start:end]))
+                if found:
+                    boundary = window_start + found[-1].end()
+                    break
+            if boundary <= i:
+                space = text.rfind(" ", window_start, end)
+                if space > i:
+                    boundary = space + 1
+            if boundary > i:
+                end = boundary
+        chunk = text[i:end]
+        if chunk:
             chunks.append(chunk)
-        if i + size >= len(text):
-            break
+        i = end
     return chunks
 
 
-def detect_pii_llm(text: str) -> Tuple[List[Dict[str, str]], bool, str]:
-    """Основной анализатор: LLM сама называет, что менять. Возвращает список сущностей."""
+def _strip_llm_wrappers(raw: str) -> str:
+    s = str(raw or "").replace("\ufeff", "")
+    fenced = re.match(r"^\s*```[A-Za-z0-9_-]*\s*\n?([\s\S]*?)\n?```\s*$", s)
+    if fenced:
+        s = fenced.group(1)
+    s = re.sub(
+        r"^\s*(?:вот|готово|измен[её]нный\s+текст|результат|ответ|текст)\s*[:\-]\s*",
+        "", s, count=1, flags=re.I)
+    return s
+
+
+def _load_llm_json(raw: str) -> Any:
+    """Достаёт JSON из ответа модели, даже если вокруг есть текст или ```."""
+    s = _strip_llm_wrappers(str(raw or ""))
+    if not s:
+        return None
+    candidates = [s]
+    starts = [i for i in (s.find("{"), s.find("[")) if i >= 0]
+    if starts:
+        start = min(starts)
+        candidates.append(s[start:])
+        close = max(s.rfind("}"), s.rfind("]"))
+        if close > start:
+            candidates.append(s[start:close + 1])
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _locate_value(text: str, value: str) -> str:
+    """Возвращает реальную подстроку текста, соответствующую строке от модели."""
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    if value in text:
+        return value
+    norm, idx = _normalize_with_map(text)
+    for m in _find_occurrences(norm, value):
+        if m.end() > m.start():
+            return text[idx[m.start()]: idx[m.end() - 1] + 1]
+    return ""
+
+
+def _parse_replacements(raw: str, chunk: str) -> List[Dict[str, str]] | None:
+    """Разбирает ответ LLM: список пар original -> replacement.
+
+    None — ответ не является JSON нужной формы (кусок дробится и запрос
+    повторяется). Пустой список — валидный ответ «менять нечего».
+    """
+    data = _load_llm_json(raw)
+    if data is None:
+        return None
+    if isinstance(data, dict):
+        items = None
+        for key in ("replacements", "changes", "pairs", "items", "data"):
+            if isinstance(data.get(key), list):
+                items = data[key]
+                break
+        if items is None:
+            return None
+    elif isinstance(data, list):
+        items = data
+    else:
+        return None
+    out: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        original = item.get("original") or item.get("source") or item.get("text") or ""
+        replacement = (item.get("replacement") or item.get("target")
+                       or item.get("fake") or "")
+        original = str(original).strip()
+        replacement = str(replacement).strip()
+        if not original or not replacement or original == replacement:
+            continue
+        located = _locate_value(chunk, original)
+        if not located or _is_bad_value(located) or _is_bad_value(replacement):
+            continue
+        key = located.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"original": located,
+                    "replacement": replacement,
+                    "type": _map_kind(str(item.get("type") or item.get("kind") or ""))
+                            or _infer_kind(located)})
+    return out
+
+
+def anonymize_text(text: str,
+                   progress: Any = None) -> Tuple[List[Dict[str, str]], bool, str]:
+    """Обезличивает текст кусками: LLM возвращает список замен для каждого куска.
+
+    Что считать персональными данными и что менять, решает только модель.
+    Программа проверяет, что original действительно есть в куске, и применяет
+    замену через Masker, не ломая разметку, таблицы и заголовки.
+    """
     s = load_settings()
-    text = (text or "").strip()
-    if not text:
+    text = text or ""
+    if not text.strip():
         return [], False, "empty"
     if not s.get("llm_enabled", True):
         return [], False, "disabled"
     llm = get_llm(s)
     if llm is None:
         return [], False, "llm_init"
-    limit = max(2000, int(s.get("max_llm_chars", 30000) or 30000))
-    size = max(1500, int(s.get("llm_chunk_chars", 4000) or 4000))
-    body = text[:limit]
-    chunks = _chunk_text(body, size, 250)
+
+    size = max(1000, int(s.get("llm_chunk_chars", 3500) or 3500))
+    limit = int(s.get("max_llm_chars", 0) or 0)
+    body = text[:limit] if limit > 0 else text
+    chunks = _split_text_chunks(body, size)
     context = rag_search("ФИО организации адреса реквизиты подписи "
                          "заголовки колонок правила маскировки")
-    found: Dict[str, Dict[str, str]] = {}
+    replacements: List[Dict[str, str]] = []
+    known: Dict[str, Tuple[str, str]] = {}
     ok = False
     error = ""
-    for chunk in chunks:
+    fatal = False
+    total = len(chunks)
+
+    def known_hint() -> str:
+        if not known:
+            return ""
+        pairs = [{"original": original, "replacement": fake}
+                 for original, fake in list(known.values())[:80]]
+        return ("Уже согласованные замены (для этих значений используй те же "
+                "replacement, если они встречаются во фрагменте; пары, которых "
+                "во фрагменте нет, не включай):\n"
+                + json.dumps(pairs, ensure_ascii=False) + "\n\n")
+
+    def remember(pairs: List[Dict[str, str]]) -> None:
+        """Добавляет новые пары и фиксирует их для следующих запросов."""
+        for replacement in pairs or []:
+            key = str(replacement.get("original") or "").strip().lower()
+            if not key or key in known:
+                # Одно и то же значение должно заменяться одинаково во всём
+                # документе: при расхождении оставляем первый вариант.
+                continue
+            known[key] = (replacement["original"], replacement["replacement"])
+            replacements.append(replacement)
+
+    def ask_replacements(chunk: str, label: str,
+                         depth: int = 0) -> List[Dict[str, str]] | None:
+        """Просит LLM назвать замены для куска. None — ответ непригоден целиком."""
+        nonlocal ok, error, fatal
+        if fatal:
+            return None
         prompt = (
             f"Правила предметной области:\n{context}\n\n"
-            f"Формат типа: {LLM_TYPES}\n\n"
-            f"Текст документа:\n{chunk}\n\n"
-            "Менять можно только значения. Не возвращай заголовки колонок и подписи "
-            "полей («Услуги», «Товары», «Назначение», «Количество», «Цена», «Сумма»). "
-            "Обязательно найди названия сторон договора после подписей «Поставщик», "
-            "«Покупатель», «Заказчик», «Исполнитель», «Подрядчик», «Арендодатель», "
-            "«Арендатор», «Сторона 1», «Сторона 2»; полные юридические формы "
-            "организаций и ИП; реквизиты и банки; суммы платежей (amount); сроки "
-            "поставки и гарантии (term); конкретные наименования товаров, работ и "
-            "услуг (item). "
-            "Верни только JSON-массив, где text — дословная цитата из документа, "
-            "type — тип: "
-            '[{"text":"...","type":"fio"}, {"text":"...","type":"org"}, '
-            '{"text":"...","type":"bank"}, {"text":"...","type":"amount"}, '
-            '{"text":"...","type":"term"}, {"text":"...","type":"item"}, '
-            '{"text":"...","type":"address"}]. Если нечего менять — [].'
+            f"{known_hint()}"
+            f"{label}. Найди значения, которые нужно обезличить, и верни JSON:\n\n"
+            f"{chunk}"
         )
-        try:
-            resp = llm.invoke([("system", LLM_SYSTEM), ("human", prompt)])
-            raw = resp.content if hasattr(resp, "content") else str(resp)
+        raw = None
+        for _ in range(2):
+            try:
+                resp = llm.invoke([("system", ANON_SYSTEM), ("human", prompt)])
+                raw = resp.content if hasattr(resp, "content") else str(resp)
+                break
+            except Exception as e:
+                error = str(e)
+                logger.warning(f"LLM anonymize chunk {label}: {e}")
+        if raw is None:
+            # Сервер LLM недоступен: нет смысла ждать на каждом следующем куске.
+            fatal = True
+            return None
+        parsed = _parse_replacements(str(raw), chunk)
+        if parsed is None and depth < 2 and len(chunk) > 1200:
+            # Модель вернула не JSON. Делим кусок и пробуем половинки:
+            # лучше больше запросов, чем пропущенные ПДн.
+            halves = _split_text_chunks(chunk, max(800, len(chunk) // 2))
+            if len(halves) > 1:
+                combined: List[Dict[str, str]] = []
+                complete = True
+                for part_index, part in enumerate(halves):
+                    got = ask_replacements(part, f"{label}.{part_index + 1}", depth + 1)
+                    if got is None:
+                        complete = False
+                    else:
+                        combined.extend(got)
+                        # Половинки идут подряд: вторая должна видеть замены
+                        # первой, чтобы не придумать другое значение.
+                        remember(got)
+                return combined if (complete or combined) else None
+        if parsed is None:
+            if not error:
+                error = "invalid_json"
+            logger.warning(f"LLM chunk {label}: no valid JSON with replacements")
+        else:
             ok = True
-        except Exception as e:
-            error = str(e)
-            logger.warning(f"LLM detect: {e}")
+        return parsed
+
+    for index, chunk in enumerate(chunks):
+        if fatal:
             break
-        for item in _parse_json_array(str(raw)):
-            if isinstance(item, dict):
-                v = item.get("text") or item.get("value") or item.get("name") or ""
-                k = str(item.get("type") or item.get("kind") or "")
-            else:
-                v, k = item, ""
-            v = _clean_value(v) if isinstance(v, str) else ""
-            if _is_bad_value(v):
-                continue
-            kind = _map_kind(k) or _infer_kind(v)
-            if not _find_occurrences(chunk, v) and not _find_occurrences(body, v):
-                continue  # модель переписала значение — не рискуем
-            key = v.lower()
-            prev = found.get(key)
-            if prev is None or (prev.get("type") in ("", "extra", "other")
-                                and kind not in ("", "extra", "other")):
-                found[key] = {"text": v, "type": kind}
-    return list(found.values()), ok, error
-
-
-def expand_variants(extras: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Добавляет встречающиеся на практике варианты: фамилия, инициалы, короткое имя org."""
-    out: List[Dict[str, str]] = []
-    seen: set[str] = set()
-
-    def add(value: str, kind: str) -> None:
-        v = _clean_value(value)
-        if _is_bad_value(v):
-            return
-        key = v.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        out.append({"text": v, "type": _map_kind(kind) or _infer_kind(v)})
-
-    def add_fio_variants(value: str) -> None:
-        toks = re.findall(r"[А-ЯЁA-Z][а-яёa-z\-]+", value)
-        if len(toks) >= 3:
-            surname, name, patr = toks[0], toks[1], toks[2]
-            add(surname, "surname")
-            add(f"{surname} {name[0]}.{patr[0]}.", "fio_initials")
-            add(f"{surname} {name[0]}. {patr[0]}.", "fio_initials")
-            add(f"{name[0]}.{patr[0]}. {surname}", "fio_initials")
-        elif len(toks) == 2:
-            add(toks[0], "surname")
-
-    for e in extras or []:
-        v = _clean_value(e.get("text", ""))
-        kind = _map_kind(e.get("type", "")) or _infer_kind(v)
-        if not v:
+        if progress:
+            progress(index, total)
+        if not chunk.strip():
             continue
-        add(v, kind)
-        if kind in ("fio", "signature"):
-            add_fio_variants(v)
-        if kind in ("org", "org_name"):
-            form, rest = _split_org(v)
-            if form and (form.upper() == "ИП" or re.search(r"(?i)индивидуальн", form)):
-                # «ИП <ФИО>» — это ФИО предпринимателя, а не бренд
-                person = rest or v
-                add(person, "fio")
-                add_fio_variants(person)
-            else:
-                inner = re.findall(r"[«\"]([^»\"]{2,80})[»\"]", v)
-                if inner:
-                    add(inner[0], "org_name")
-                elif form and rest:
-                    add(rest, "org_name")
-        if kind == "address":
-            m = re.search(r"(?i)(?:г\.|город)\s*([А-ЯЁ][\w\-]+)", v)
-            if m:
-                add(m.group(1), "city")
-            m = re.search(r"(?i)(?:ул\.|улица|пр-т|проспект|пер\.|переулок|наб\.|"
-                          r"набережная|ш\.|шоссе)\s*([А-ЯЁ][\w\-]+)", v)
-            if m:
-                add(m.group(1), "street")
-    return out
+        chunk_replacements = ask_replacements(chunk, f"Фрагмент {index + 1} из {total}")
+        if chunk_replacements is None:
+            continue
+        remember(chunk_replacements)
+        if progress:
+            progress(index + 1, total)
+    if progress:
+        progress(total, total)
+    # fatal — LLM перестала отвечать посреди документа. Тогда не применяем
+    # частичные замены: документ должен остаться нетронутым.
+    return replacements, bool(ok and not fatal), error
 
 
-def _augment_org_variants(text: str, extras: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Добавляет короткие названия организаций, найденные регулярками.
+def _llm_failure_message(error: str) -> str:
+    """Понятная причина, по которой документ не обрабатывался."""
+    if error == "disabled":
+        return "LLM отключена — обезличивание невозможно"
+    if error == "llm_init":
+        return "LLM недоступна — обработка отменена"
+    if error == "empty":
+        return "В документе не найден текст для обезличивания"
+    if error == "invalid_json":
+        return "LLM вернула некорректный ответ — обработка отменена"
+    return "LLM не отвечает — обработка отменена" + (f": {error[:200]}" if error else "")
 
-    LLM может быть недоступна, а в договоре после полного названия «ООО «…»»
-    далее используется только бренд. Без этого варианта он остался бы открытым.
-    """
-    out = list(extras or [])
-    seen = {str(e.get("text", "")).lower() for e in out}
 
-    def add(value: str, kind: str) -> None:
-        v = _clean_value(value)
-        if not v or _is_bad_value(v):
-            return
-        key = v.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        out.append({"text": v, "type": kind})
+def _build_replacement_masker(replacements: Any) -> Masker:
+    masker = Masker()
+    for replacement in replacements or []:
+        if not isinstance(replacement, dict):
+            continue
+        original = replacement.get("original") or replacement.get("text") or ""
+        fake = replacement.get("replacement") or replacement.get("fake") or ""
+        kind = str(replacement.get("type") or replacement.get("kind") or "")
+        masker.set_exact(original, fake, kind)
+    return masker
 
-    def handle(value: str) -> None:
-        form, rest = _split_org(value)
-        inner = re.findall(r"[«\"]([^»\"]{2,80})[»\"]", value)
-        if inner:
-            add(inner[0], "org_name")
-        elif form and rest:
-            add(rest, "org_name")
 
-    for kind, rx, group in GROUP_PATTERNS:
-        if kind == "org":
-            for m in rx.finditer(text or ""):
-                handle(m.group(group))
-    for kind, rx in PLAIN_PATTERNS:
-        if kind == "org":
-            for m in rx.finditer(text or ""):
-                handle(m.group(0))
-    return out
+def _replacement_extras(replacements: Any) -> List[Dict[str, str]]:
+    extras: List[Dict[str, str]] = []
+    for replacement in replacements or []:
+        if not isinstance(replacement, dict):
+            continue
+        original = replacement.get("original") or replacement.get("text") or ""
+        if original:
+            extras.append({"text": original,
+                           "type": str(replacement.get("type") or "")})
+    return extras
+
 
 # ---------------------------------------------------------------- обработка файлов
 def extract_pdf_text(path: Path) -> str:
@@ -2513,7 +2406,9 @@ def _scrub_pdf_metadata(doc, extras: Any, masker: Masker) -> int:
     return masked
 
 
-def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict[str, Any]:
+def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = (),
+                  masker: Masker | None = None,
+                  progress: Any = None) -> Dict[str, Any]:
     """Заменяет ПДн в PDF: ищет сущности по всему блоку и перерисовывает затронутые span.
 
     Поиск идёт не по отдельному span, а по склеенному тексту блока/строки, поэтому
@@ -2526,8 +2421,8 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict
         raise ValueError("PDF защищён паролем")
     total = 0
     pages = len(doc)
-    masker = Masker()
-    for page in doc:
+    masker = masker or Masker()
+    for page_index, page in enumerate(doc):
         page_dict = page.get_text("dict")
         blocks = page_dict.get("blocks", [])
         page_spans: List[Dict[str, Any]] = []
@@ -2618,6 +2513,8 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict
                          draw_text, _span_color(span), path, rot))
         if not jobs:
             total += _scrub_pdf_annotations(page, extras, masker)
+            if progress:
+                progress(page_index + 1, pages)
             continue
         for rects, _, _, _, _, _, _ in jobs:
             for bbox in rects:
@@ -2641,6 +2538,8 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict
                 page.insert_text(origin, MASK, fontname="helv", fontsize=fs,
                                  color=color, rotate=rot)
         total += _scrub_pdf_annotations(page, extras, masker)
+        if progress:
+            progress(page_index + 1, pages)
     total += _scrub_pdf_metadata(doc, extras, masker)
     doc.save(output_path, garbage=3, deflate=True)
     doc.close()
@@ -2697,11 +2596,13 @@ def _to_number(text: str, as_int: bool):
     return int(round(value)) if as_int else value
 
 
-def extract_excel_text(path: Path, limit: int = 30000) -> str:
+def extract_excel_text(path: Path, limit: int = 0) -> str:
+    """Текст всех листов. limit=0 — без ограничения: документ режется на куски позже."""
     import openpyxl
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     parts: List[str] = []
     size = 0
+    limit = max(0, int(limit or 0))
     try:
         for ws in wb.worksheets:
             for row in ws.iter_rows(values_only=True):
@@ -2720,7 +2621,7 @@ def extract_excel_text(path: Path, limit: int = 30000) -> str:
                     line = " ".join(vals)
                     parts.append(line)
                     size += len(line) + 1
-                    if size >= limit:
+                    if limit and size >= limit:
                         return "\n".join(parts)
             try:
                 for part in _header_footer_parts(ws):
@@ -2775,13 +2676,16 @@ def _scrub_excel_properties(wb, masker: Masker, extras: Any) -> int:
     return masked
 
 
-def mask_excel_file(input_path: Path, output_path: Path, extras: Any = ()) -> Dict[str, Any]:
+def mask_excel_file(input_path: Path, output_path: Path, extras: Any = (),
+                    masker: Masker | None = None,
+                    progress: Any = None) -> Dict[str, Any]:
     import openpyxl
     wb = openpyxl.load_workbook(input_path)
-    masker = Masker()
+    masker = masker or Masker()
     masked = 0
     try:
-        for ws in wb.worksheets:
+        sheets = list(wb.worksheets)
+        for sheet_index, ws in enumerate(sheets):
             for row in ws.iter_rows():
                 # Комментарии и цели гиперссылок — отдельно от значений.
                 for cell in row:
@@ -2917,6 +2821,8 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = ()) -> Di
                     if new != text:
                         part.text = new
                         masked += 1
+            if progress:
+                progress(sheet_index + 1, len(sheets))
         masked += _scrub_excel_properties(wb, masker, extras)
         wb.save(output_path)
         preview = _excel_preview(wb.active)
@@ -2924,16 +2830,43 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = ()) -> Di
         wb.close()
     return {"masked": masked, "pages": 1, "preview_rows": preview}
 
-def process_pdf(input_path: Path, output_path: Path) -> Dict[str, Any]:
+def _progress_callback(progress: Any, start: int, span: int, stage: str):
+    """Приводит прогресс обработки кусков/страниц к общему проценту."""
+    def report(done: int, total: int) -> None:
+        if not progress:
+            return
+        total = max(1, int(total or 1))
+        pct = start + int(span * min(max(done, 0), total) / total)
+        progress(min(99, pct), stage)
+    return report
+
+
+def process_pdf(input_path: Path, output_path: Path,
+                progress: Any = None) -> Dict[str, Any]:
+    def report(pct: int, stage: str) -> None:
+        if progress:
+            progress(max(0, min(99, int(pct))), stage)
+
+    report(1, "Извлечение текста")
     warning = None
     ratio = _pdf_text_ratio(input_path)
     if ratio < 0.5:
         warning = "PDF похож на скан: часть страниц без текстового слоя. OCR не поддерживается — эти страницы не будут обезличены."
         logger.warning(f"PDF scan-like: {input_path.name}, text_pages_ratio={ratio:.2f}")
     text = extract_pdf_text(input_path)
-    extras, llm_ok, llm_error = detect_pii_llm(text)
-    extras = _augment_org_variants(text, expand_variants(extras))
-    stats = mask_pdf_file(input_path, output_path, extras)
+    report(5, "Поиск персональных данных")
+    replacements, llm_ok, llm_error = anonymize_text(
+        text, _progress_callback(progress, 5, 67, "Обезличивание текста"))
+    if not llm_ok:
+        # LLM не ответила или ответила мусором: ничего не меняем и не сохраняем.
+        raise RuntimeError(_llm_failure_message(llm_error))
+    report(73, "Применение замен")
+    extras = _replacement_extras(replacements)
+    masker = _build_replacement_masker(replacements)
+    stats = mask_pdf_file(
+        input_path, output_path, extras, masker=masker,
+        progress=_progress_callback(progress, 73, 24, "Перерисовка документа"))
+    report(98, "Сохранение")
     preview = ""
     try:
         import pymupdf
@@ -2945,6 +2878,7 @@ def process_pdf(input_path: Path, output_path: Path) -> Dict[str, Any]:
             doc.close()
     except Exception:
         pass
+    report(100, "Готово")
     result: Dict[str, Any] = {"preview_type": "pdf", "preview": preview, "llm_used": llm_ok,
                               "extras": [e["text"] for e in extras[:80]], **stats}
     if warning:
@@ -2954,11 +2888,27 @@ def process_pdf(input_path: Path, output_path: Path) -> Dict[str, Any]:
     return result
 
 
-def process_excel(input_path: Path, output_path: Path) -> Dict[str, Any]:
+def process_excel(input_path: Path, output_path: Path,
+                  progress: Any = None) -> Dict[str, Any]:
+    def report(pct: int, stage: str) -> None:
+        if progress:
+            progress(max(0, min(99, int(pct))), stage)
+
+    report(1, "Извлечение текста")
     text = extract_excel_text(input_path)
-    extras, llm_ok, llm_error = detect_pii_llm(text)
-    extras = _augment_org_variants(text, expand_variants(extras))
-    stats = mask_excel_file(input_path, output_path, extras)
+    report(5, "Поиск персональных данных")
+    replacements, llm_ok, llm_error = anonymize_text(
+        text, _progress_callback(progress, 5, 67, "Обезличивание текста"))
+    if not llm_ok:
+        # LLM не ответила или ответила мусором: ничего не меняем и не сохраняем.
+        raise RuntimeError(_llm_failure_message(llm_error))
+    report(73, "Применение замен")
+    extras = _replacement_extras(replacements)
+    masker = _build_replacement_masker(replacements)
+    stats = mask_excel_file(
+        input_path, output_path, extras, masker=masker,
+        progress=_progress_callback(progress, 73, 24, "Перерисовка документа"))
+    report(98, "Сохранение")
     result: Dict[str, Any] = {"preview_type": "excel", "preview": stats.pop("preview_rows", []),
                               "llm_used": llm_ok,
                               "extras": [e["text"] for e in extras[:80]], **stats}
@@ -3024,6 +2974,11 @@ def _safe_name(name: str) -> str:
 @app.post("/api/process")
 def process(file: UploadFile = File(...), user: str = Depends(get_current_user)):
     s = load_settings()
+    if not s.get("llm_enabled", True):
+        raise HTTPException(400, "LLM отключена — обезличивание невозможно")
+    if not check_llm(s):
+        # Без LLM обрабатывать нечем: не принимаем файл и не создаём задание.
+        raise HTTPException(503, "LLM недоступна — загрузка не начата")
     original = _safe_name(file.filename or "document")
     ext = Path(original).suffix.lower()
     if ext not in (".pdf", ".xlsx"):
@@ -3037,27 +2992,60 @@ def process(file: UploadFile = File(...), user: str = Depends(get_current_user))
     if len(content) > max_mb * 1024 * 1024:
         raise HTTPException(413, f"Файл больше {max_mb} МБ")
 
+    _prune_jobs()
     uid = uuid.uuid4().hex[:12]
+    job_id = uuid.uuid4().hex
     in_path = UPLOAD_DIR / f"{user}_{uid}_{original}"
     out_name = f"masked_{uid}_{original}"
     out_path = OUTPUT_DIR / out_name
     in_path.write_bytes(content)
 
-    started = time.time()
-    with PROCESS_LOCK:
-        try:
-            result = process_pdf(in_path, out_path) if ext == ".pdf" else process_excel(in_path, out_path)
-        except Exception as e:
-            logger.error(f"PROCESS_ERROR | {user} | {original} | {e}")
-            raise HTTPException(500, f"Ошибка обработки: {e}")
-        finally:
-            in_path.unlink(missing_ok=True)
+    job = {
+        "id": job_id,
+        "user": user,
+        "filename": original,
+        "size": len(content),
+        "status": "queued",
+        "progress": 0,
+        "stage": "В очереди",
+        "elapsed": 0,
+        "error": "",
+        "created": time.time(),
+        "download_name": f"masked_{original}",
+        "out_name": out_name,
+        "result": None,
+    }
+    with JOBS_LOCK:
+        JOBS[job_id] = job
 
-    elapsed = round(time.time() - started, 1)
-    logger.info(f"MASK | user={user} | file={original} | masked={result.get('masked')} | "
-                f"llm={result.get('llm_used')} | {elapsed}s")
-    return {"ok": True, "filename": original, "download_name": f"masked_{original}",
-            "download_url": f"/api/download/{out_name}", "elapsed": elapsed, **result}
+    threading.Thread(
+        target=_run_job,
+        args=(job_id, in_path, out_path, ext),
+        daemon=True,
+        name=f"job-{uid}",
+    ).start()
+    logger.info(f"QUEUE | user={user} | file={original} | job={job_id}")
+    return {"ok": True, "job_id": job_id, "filename": original,
+            "status": "queued", "progress": 0}
+
+
+@app.get("/api/jobs")
+def jobs(user: str = Depends(get_current_user)):
+    with JOBS_LOCK:
+        items = [_public_job(job) for job in JOBS.values()
+                 if job.get("user") == user]
+    items.sort(key=lambda item: item.get("created") or 0)
+    return {"ok": True, "jobs": items}
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str, user: str = Depends(get_current_user)):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None or job.get("user") != user:
+            raise HTTPException(404, "Задание не найдено")
+        data = _public_job(job)
+    return {"ok": True, **data}
 
 
 @app.get("/api/download/{filename}")

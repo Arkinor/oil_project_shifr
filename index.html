@@ -104,6 +104,8 @@
   .btn-row{font-size:12.5px;padding:7px 12px;border-radius:8px;white-space:nowrap}
   .btn-row-dl{background:var(--green);color:#fff}
   .btn-row-dl:hover:not(:disabled){background:var(--green-h)}
+  .btn-row-del{background:transparent;color:var(--err);border:1px solid var(--border);margin-left:6px}
+  .btn-row-del:hover:not(:disabled){border-color:var(--err)}
 
   .hidden{display:none!important}
 
@@ -228,8 +230,9 @@ function logout() {
   resetUpload();
 }
 function resetUpload() {
-  for (const item of queue) if (item.timer) clearInterval(item.timer);
+  processing = false;
   queue = [];
+  clearQueueStorage();
   $("file").value = "";
   $("filesBody").textContent = "";
   $("fname").classList.add("hidden");
@@ -269,6 +272,7 @@ async function login() {
     sessionStorage.setItem("creds", JSON.stringify(creds));
     $("password").value = "";
     showApp();
+    restoreQueue();
   } catch (e) {
     $("loginMsg").textContent = e.message;
   } finally {
@@ -281,10 +285,104 @@ $("password").addEventListener("keydown", e => { if (e.key === "Enter") login();
 $("login").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
 $("logout").addEventListener("click", logout);
 
-// ---------- выбор файлов ----------
+// ---------- выбор файлов и сохранение состояния ----------
 let queue = [];
 let processing = false;
 let nextFileId = 1;
+let restoring = false;
+
+// Состояние очереди (включая сами файлы) храним в IndexedDB. Благодаря этому
+// перезагрузка страницы не теряет ни прогресс, ни ещё не отправленные файлы.
+const DB_NAME = "pii_masker_state";
+const DB_STORE = "items";
+const DB_VERSION = 1;
+let dbPromise = null;
+
+function openDB() {
+  if (!("indexedDB" in window)) return Promise.resolve(null);
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise(resolve => {
+    try {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(DB_STORE))
+          db.createObjectStore(DB_STORE, { keyPath: "id" });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+  return dbPromise;
+}
+
+async function idbGetAll() {
+  const db = await openDB();
+  if (!db) return [];
+  return new Promise(resolve => {
+    try {
+      const tx = db.transaction(DB_STORE, "readonly");
+      const req = tx.objectStore(DB_STORE).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => resolve([]);
+    } catch {
+      resolve([]);
+    }
+  });
+}
+
+function itemSnapshot(item) {
+  return {
+    id: item.id,
+    name: item.name,
+    size: item.size,
+    lastModified: item.lastModified,
+    blob: item.blob || null,
+    status: item.status,
+    stage: item.stage || "",
+    jobId: item.jobId || "",
+    pct: item.pct || 0,
+    elapsed: item.elapsed,
+    error: item.error || "",
+    note: item.note || "",
+    downloadUrl: item.downloadUrl || "",
+    downloadName: item.downloadName || "",
+    previewType: item.previewType || "",
+    preview: item.preview || null,
+    createdAt: item.createdAt || Date.now()
+  };
+}
+
+async function saveItem(item) {
+  const db = await openDB();
+  if (!db) return;
+  try {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    tx.objectStore(DB_STORE).put(itemSnapshot(item));
+  } catch {}
+}
+
+async function idbDelete(id) {
+  const db = await openDB();
+  if (!db) return;
+  try {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    tx.objectStore(DB_STORE).delete(id);
+  } catch {}
+}
+
+async function clearQueueStorage() {
+  const db = await openDB();
+  if (!db) return;
+  try {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    tx.objectStore(DB_STORE).clear();
+  } catch {}
+}
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 function pickFiles() { $("file").click(); }
 $("drop").addEventListener("click", pickFiles);
@@ -315,11 +413,12 @@ function createRow(item) {
 
   const nameTd = document.createElement("td");
   nameTd.className = "fname";
-  nameTd.textContent = item.file.name;
+  nameTd.textContent = item.name || (item.file && item.file.name) || "документ";
 
   const sizeTd = document.createElement("td");
   sizeTd.className = "muted";
-  sizeTd.textContent = formatSize(item.file.size);
+  sizeTd.textContent = formatSize(item.size != null ? item.size
+                                                   : (item.file ? item.file.size : null));
 
   const statusTd = document.createElement("td");
   const progressTd = document.createElement("td");
@@ -336,8 +435,7 @@ function createRow(item) {
   tr.appendChild(actionTd);
   $("filesBody").appendChild(tr);
 
-  item.pct = 0;
-  item.timer = null;
+  if (item.pct == null) item.pct = 0;
   item.els = { status: statusTd, progress: progressTd, time: timeTd, action: actionTd };
   return tr;
 }
@@ -345,20 +443,59 @@ function createRow(item) {
 function addFiles(fileList) {
   const files = Array.from(fileList || []);
   if (!files.length) return;
+  if (restoring) {
+    // Дождёмся восстановления очереди, иначе восстановление перезапишет
+    // только что добавленные файлы.
+    setTimeout(() => addFiles(files), 150);
+    return;
+  }
 
   const skipped = [];
   let added = 0;
   for (const f of files) {
     const name = (f.name || "").toLowerCase();
     if (!name.endsWith(".pdf") && !name.endsWith(".xlsx")) { skipped.push(f.name); continue; }
-    const dup = queue.some(q => q.file.name === f.name && q.file.size === f.size &&
-                               q.file.lastModified === f.lastModified);
-    if (dup) continue;
-    const item = { id: nextFileId++, file: f, status: "pending", error: "",
-                   note: "", elapsed: null, downloadUrl: "", downloadName: "" };
+    const sameFile = q => (q.name || (q.file && q.file.name)) === f.name &&
+                          q.size === f.size && q.lastModified === f.lastModified;
+    // Повторно отправлять можно только файл, который уже не в работе.
+    // Обработанную или упавшую строку убираем, иначе проверка дублей
+    // блокирует повторную загрузку того же документа.
+    if (queue.some(q => sameFile(q) && q.status !== "done" && q.status !== "error")) continue;
+    const stale = queue.filter(q => sameFile(q) && (q.status === "done" || q.status === "error"));
+    if (stale.length) {
+      for (const old of stale) {
+        if (old.els && old.els.status) {
+          const tr = old.els.status.closest("tr");
+          if (tr) tr.remove();
+        }
+        idbDelete(old.id);
+      }
+      queue = queue.filter(q => !stale.includes(q));
+    }
+    const item = {
+      id: nextFileId++,
+      name: f.name,
+      size: f.size,
+      lastModified: f.lastModified,
+      blob: f,
+      file: f,
+      status: "pending",
+      stage: "",
+      jobId: "",
+      pct: 0,
+      elapsed: null,
+      error: "",
+      note: "",
+      downloadUrl: "",
+      downloadName: "",
+      previewType: "",
+      preview: null,
+      createdAt: Date.now()
+    };
     createRow(item);
     queue.push(item);
     updateRow(item);
+    saveItem(item);
     added++;
   }
 
@@ -375,30 +512,42 @@ function addFiles(fileList) {
 }
 
 function updateSelectedInfo() {
-  const n = queue.length;
+  // В поле выбора показываем только файлы, которые ещё не отправлены:
+  // после запуска обработки оно очищается, и можно добавить новый документ.
+  const ready = queue.filter(q => q.status === "pending" || q.status === "uploading");
+  const n = ready.length;
   if (!n) {
     $("fname").textContent = "";
     $("fname").classList.add("hidden");
     $("drop").classList.remove("has-file");
     return;
   }
-  $("fname").textContent = n === 1 ? queue[0].file.name : "Выбрано файлов: " + n;
+  $("fname").textContent = n === 1 ? (ready[0].name || (ready[0].file ? ready[0].file.name : ""))
+                                  : "Выбрано файлов: " + n;
   $("fname").classList.remove("hidden");
   $("drop").classList.add("has-file");
 }
 
 function renderProgress(item, pct) {
+  if (!item.els) return;
   const el = item.els.progress.firstChild;
-  const p = Math.max(0, Math.min(100, Math.round(pct)));
+  const p = Math.max(0, Math.min(100, Math.round(pct || 0)));
   item.pct = p;
   el.style.setProperty("--p", p);
   el.firstChild.textContent = p + "%";
   el.classList.toggle("err", item.status === "error");
 }
 
+function isActiveStatus(status) {
+  return status === "uploading" || status === "queued" || status === "processing";
+}
+
 function updateRow(item) {
+  if (!item.els) return;
   const labels = {
     pending: ["В очереди", "status-pending"],
+    uploading: ["Загрузка…", "status-processing"],
+    queued: ["В очереди", "status-pending"],
     processing: ["Обработка…", "status-processing"],
     done: ["Готово", "status-done"],
     error: ["Ошибка", "status-error"]
@@ -410,22 +559,26 @@ function updateRow(item) {
   pill.className = "status-pill " + cls;
   pill.textContent = label;
   statusTd.appendChild(pill);
+
+  const noteText = item.error
+    ? ""
+    : (item.note || (isActiveStatus(item.status) && item.stage ? item.stage : ""));
   if (item.error) {
     const err = document.createElement("span");
     err.className = "file-error";
     err.textContent = item.error;
     statusTd.appendChild(err);
-  } else if (item.note) {
+  } else if (noteText) {
     const note = document.createElement("span");
     note.className = "file-note";
-    note.textContent = item.note;
+    note.textContent = noteText;
     statusTd.appendChild(note);
   }
 
   item.els.time.textContent = item.elapsed != null ? item.elapsed + " с" : "—";
 
-  renderProgress(item, item.status === "done" ? 100
-                    : item.status === "processing" ? item.pct : 0);
+  // Показываем только реальный прогресс с сервера, без искусственного роста.
+  renderProgress(item, item.status === "done" ? 100 : (item.pct || 0));
 
   const actionTd = item.els.action;
   actionTd.textContent = "";
@@ -437,10 +590,34 @@ function updateRow(item) {
     btn.textContent = "Скачать";
     btn.addEventListener("click", () => downloadFile(item.downloadUrl, item.downloadName));
   } else {
-    btn.textContent = item.status === "processing" ? "Подождите" : "Скачать";
+    btn.textContent = isActiveStatus(item.status) ? "Подождите" : "Скачать";
     btn.disabled = true;
   }
   actionTd.appendChild(btn);
+  // Пока файл не в работе, его можно убрать из списка: например, если
+  // случайно добавили не тот документ.
+  if (!isActiveStatus(item.status)) {
+    const del = document.createElement("button");
+    del.className = "btn-row btn-row-del";
+    del.type = "button";
+    del.textContent = "Удалить";
+    del.addEventListener("click", () => removeItem(item));
+    actionTd.appendChild(del);
+  }
+}
+
+function removeItem(item) {
+  if (isActiveStatus(item.status)) return;
+  if (item.els && item.els.status) {
+    const tr = item.els.status.closest("tr");
+    if (tr) tr.remove();
+  }
+  idbDelete(item.id);
+  queue = queue.filter(q => q !== item);
+  updateSelectedInfo();
+  updateSummary();
+  updateButton();
+  if (!queue.length) $("result").classList.add("hidden");
 }
 
 function updateSummary() {
@@ -448,7 +625,7 @@ function updateSummary() {
   if (!total) { $("summary").textContent = ""; return; }
   const done = queue.filter(q => q.status === "done").length;
   const errors = queue.filter(q => q.status === "error").length;
-  const active = queue.filter(q => q.status === "processing").length;
+  const active = queue.filter(q => isActiveStatus(q.status)).length;
   let text = "Готово " + done + " из " + total;
   if (errors) text += ", с ошибкой: " + errors;
   if (active) text += " — идёт обработка…";
@@ -456,16 +633,152 @@ function updateSummary() {
 }
 
 function updateButton() {
-  $("btn").disabled = processing || !queue.some(q => q.status === "pending");
+  $("btn").disabled = processing || !queue.some(q => q.status === "pending" ||
+                                                     q.status === "uploading");
 }
 
-// ---------- обработка: строго по одному файлу ----------
+// ---------- обработка: серверная очередь + реальный прогресс ----------
 $("btn").addEventListener("click", processAll);
+
+function finishStatus() {
+  const errors = queue.filter(q => q.status === "error").length;
+  setStatus(errors ? "Обработка завершена, ошибок: " + errors
+                   : "Все файлы готовы. Скачивайте по одному.",
+            errors ? "err" : "ok");
+}
+
+async function uploadPending() {
+  for (const item of queue) {
+    if (!creds) return;
+    if (item.jobId) continue;
+    if (item.status === "done" || item.status === "error") continue;
+    const blob = item.blob || item.file;
+    if (!blob) {
+      item.status = "error";
+      item.error = "Файл недоступен после перезагрузки — добавьте его снова";
+      item.pct = 0;
+      saveItem(item);
+      updateRow(item);
+      continue;
+    }
+    item.status = "uploading";
+    item.stage = "Отправка на сервер";
+    item.pct = 0;
+    item.error = "";
+    item.note = "";
+    item.elapsed = null;
+    updateRow(item);
+    updateSummary();
+    await saveItem(item);
+    try {
+      const fd = new FormData();
+      fd.append("file", blob, item.name || blob.name || "document");
+      const r = await fetch("/api/process", {
+        method: "POST", headers: headers(), body: fd
+      });
+      let d = {};
+      try { d = await r.json(); } catch {}
+      if (r.status === 401) {
+        logout();
+        $("loginMsg").textContent = "Сессия истекла, войдите снова";
+        return;
+      }
+      if (!r.ok) throw new Error(d.detail || "Не удалось отправить файл");
+      item.jobId = d.job_id || "";
+      item.status = "queued";
+      item.stage = "В очереди";
+      item.pct = 0;
+      // Сервер уже принял файл и хранит задание. Сам файл больше не нужен:
+      // не переписываем большой blob в IndexedDB на каждом шаге прогресса.
+      item.blob = null;
+      item.file = null;
+      await saveItem(item);
+    } catch (e) {
+      item.status = "error";
+      item.error = e.message;
+      item.pct = 0;
+      await saveItem(item);
+    }
+    updateRow(item);
+    updateSummary();
+  }
+}
+
+async function applyJob(item, job) {
+  const prevStatus = item.status;
+  item.status = job.status || item.status;
+  item.pct = job.progress != null ? job.progress : (item.pct || 0);
+  item.stage = job.stage || "";
+  item.elapsed = job.elapsed != null ? job.elapsed : item.elapsed;
+
+  if (item.status === "done") {
+    item.pct = 100;
+    item.downloadUrl = job.download_url || item.downloadUrl;
+    item.downloadName = job.download_name || item.downloadName || ("masked_" + item.name);
+    item.note = job.warning || (job.llm_error
+      ? "LLM вернула ошибку на части фрагментов"
+      : "");
+    item.previewType = job.preview_type || "";
+    item.preview = job.preview != null ? job.preview : null;
+    item.blob = null;
+    item.file = null;
+    renderPreview(job, item.name);
+  } else if (item.status === "error") {
+    item.error = job.error || "Не удалось обработать файл";
+    item.pct = 0;
+  } else {
+    item.error = "";
+  }
+
+  if (prevStatus !== item.status || isActiveStatus(item.status))
+    await saveItem(item);
+}
+
+async function pollUntilDone() {
+  while (processing && creds) {
+    const active = queue.filter(q => q.jobId && isActiveStatus(q.status));
+    if (!active.length) break;
+    try {
+      const r = await fetch("/api/jobs", { headers: headers() });
+      if (r.status === 401) {
+        logout();
+        $("loginMsg").textContent = "Сессия истекла, войдите снова";
+        return;
+      }
+      if (r.ok) {
+        const d = await r.json();
+        const byId = new Map((d.jobs || []).map(j => [j.id, j]));
+        for (const item of queue) {
+          if (!item.jobId) continue;
+          if (item.status === "done" || item.status === "error") continue;
+          const job = byId.get(item.jobId);
+          if (!job) {
+            item.missing = (item.missing || 0) + 1;
+            if (item.missing >= 3) {
+              item.status = "error";
+              item.error = "Задание не найдено на сервере (возможно, сервер перезапущен)";
+              item.pct = 0;
+              saveItem(item);
+              updateRow(item);
+            }
+            continue;
+          }
+          item.missing = 0;
+          await applyJob(item, job);
+          updateRow(item);
+        }
+      }
+    } catch {}
+    updateSummary();
+    if (!queue.some(q => q.jobId && isActiveStatus(q.status))) break;
+    await sleep(900);
+  }
+}
 
 async function processAll() {
   if (processing) return;
   if (!creds) { logout(); return; }
-  if (!queue.some(q => q.status === "pending")) {
+  if (!queue.some(q => q.status === "pending" || q.status === "uploading")) {
     setStatus("Добавьте файлы для обработки", "err");
     return;
   }
@@ -474,69 +787,79 @@ async function processAll() {
   $("btn").disabled = true;
   setStatus("Файлы обрабатываются, ожидайте....", "");
 
-  for (const item of queue) {
-    if (!creds) break;
-    if (item.status !== "pending") continue;
-    await processOne(item);
+  try {
+    await uploadPending();
+    await pollUntilDone();
+  } finally {
+    // Снимаем блокировку при любом сбое, иначе кнопка останется недоступной
+    // и новые файлы нельзя будет отправить без перезагрузки страницы.
+    processing = false;
+    updateButton();
     updateSummary();
+    updateSelectedInfo();
   }
-
-  processing = false;
-  updateButton();
-  updateSummary();
   if (!creds) return;
-  const errors = queue.filter(q => q.status === "error").length;
-  setStatus(errors ? "Обработка завершена, ошибок: " + errors
-                   : "Все файлы готовы. Скачивайте по одному.",
-            errors ? "err" : "ok");
+  finishStatus();
 }
 
-async function processOne(item) {
-  item.status = "processing";
-  item.error = "";
-  item.note = "";
-  item.elapsed = null;
-  updateRow(item);
-  updateSummary();
-
-  if (item.timer) clearInterval(item.timer);
-  item.timer = setInterval(() => {
-    if (item.pct < 95) {
-      const step = Math.max(1, Math.round((95 - item.pct) * 0.08));
-      renderProgress(item, Math.min(95, item.pct + step));
-    }
-  }, 400);
-
-  const started = performance.now();
+async function restoreQueue() {
+  if (restoring) return;
+  restoring = true;
   try {
-    const fd = new FormData();
-    fd.append("file", item.file);
-    const r = await fetch("/api/process", { method: "POST", headers: headers(), body: fd });
-    let d = {};
-    try { d = await r.json(); } catch {}
-    if (r.status === 401) {
-      logout();
-      $("loginMsg").textContent = "Сессия истекла, войдите снова";
-      return;
+    const saved = await idbGetAll();
+    if (!saved.length) return;
+    queue = saved.map(raw => {
+      const blob = raw.blob || null;
+      return {
+        ...raw,
+        blob,
+        file: blob ? new File([blob], raw.name || "document", {
+          type: blob.type || "", lastModified: raw.lastModified || Date.now()
+        }) : null,
+        els: null,
+        pct: raw.pct || 0,
+        missing: 0
+      };
+    }).sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
+
+    nextFileId = Math.max(0, ...queue.map(q => Number(q.id) || 0)) + 1;
+    $("filesBody").textContent = "";
+    for (const item of queue) {
+      createRow(item);
+      updateRow(item);
     }
-    if (!r.ok) throw new Error(d.detail || "Не удалось обработать файл");
-    item.status = "done";
-    item.downloadUrl = d.download_url;
-    item.downloadName = d.download_name || ("masked_" + item.file.name);
-    item.elapsed = d.elapsed != null ? d.elapsed
-                                     : Math.round((performance.now() - started) / 100) / 10;
-    item.note = d.warning || (d.llm_error
-      ? (d.llm_error === "disabled" ? "LLM отключена — использованы только правила"
-                                    : "LLM недоступна — использованы только правила")
-      : "");
-    renderPreview(d, item.file.name);
-  } catch (e) {
-    item.status = "error";
-    item.error = e.message;
+    updateSelectedInfo();
+    $("result").classList.remove("hidden");
+    updateSummary();
+    updateButton();
+
+    const lastDone = [...queue].reverse().find(q => q.status === "done" && q.preview != null);
+    if (lastDone)
+      renderPreview({ preview_type: lastDone.previewType, preview: lastDone.preview },
+                    lastDone.name);
+
+    // Прерванная загрузка (страницу перезагрузили посреди отправки) — это
+    // незавершённая обработка, её продолжаем сами. Просто добавленные, но так и
+    // не запущенные файлы не отправляем: пользователь сам нажмёт «Обработать».
+    const interrupted = queue.some(q => !q.jobId && q.status === "uploading");
+    const hasActive = queue.some(q => q.jobId && isActiveStatus(q.status));
+    if (interrupted || hasActive) {
+      processing = true;
+      $("btn").disabled = true;
+      setStatus("Восстанавливаю обработку…", "");
+      try {
+        await uploadPending();
+        await pollUntilDone();
+      } finally {
+        processing = false;
+        updateButton();
+        updateSummary();
+      }
+      if (creds) finishStatus();
+    }
+  } finally {
+    restoring = false;
   }
-  if (item.timer) { clearInterval(item.timer); item.timer = null; }
-  item.pct = item.status === "done" ? 100 : 0;
-  updateRow(item);
 }
 
 async function downloadFile(url, name) {
@@ -596,7 +919,7 @@ function renderPreview(d, filename) {
 // ---------- старт ----------
 if (creds) {
   fetch("/api/me", { headers: headers() })
-    .then(r => { if (r.ok) showApp(); else logout(); })
+    .then(r => { if (r.ok) { showApp(); restoreQueue(); } else logout(); })
     .catch(() => logout());
 } else {
   showLogin();
