@@ -566,14 +566,85 @@ def _distribute_replacement(fake: str, pieces: List[str]) -> List[str]:
 # какого места документа она взята (страница/лист/часть), поэтому замены
 # потом применяются к исходной разметке, а не к переписанному тексту.
 CHUNK_OVERLAP = 400
-_JSON_MODE_SUPPORTED = True
+# LM Studio (как и OpenAI) понимает response_format.type = "json_schema", но
+# отклоняет устаревший "json_object" с HTTP 400. Схема дублирует формат, который
+# разбирает _parse_replacements; strict-режим не даёт модели добавить лишние поля.
+_REPLACEMENTS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "replacements": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "original": {"type": "string"},
+                    "replacement": {"type": "string"},
+                    "type": {"type": "string"},
+                },
+                "required": ["original", "replacement", "type"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["replacements"],
+    "additionalProperties": False,
+}
+_JSON_RESPONSE_FORMAT: Dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "pii_replacements",
+        "strict": True,
+        "schema": _REPLACEMENTS_SCHEMA,
+    },
+}
+# JSON-режим и успешный прогрев хранятся не глобально, а для пары
+# «сервер + модель»: при смене модели в settings.json не нужно перезапускать
+# процесс, а отказ одной модели не выключает JSON-режим для другой.
+_JSON_MODE_OFF: set[Tuple[str, str]] = set()
+_JSON_MODE_LOCK = threading.Lock()
+_WARMED_MODELS: set[Tuple[str, str]] = set()
+_WARM_LOCK = threading.Lock()
+
+
+def _llm_key(settings: Dict[str, Any]) -> Tuple[str, str]:
+    return (str(settings.get("lm_studio_url") or "").rstrip("/"),
+            str(settings.get("model") or ""))
+
+
+def _json_mode_enabled(settings: Dict[str, Any]) -> bool:
+    with _JSON_MODE_LOCK:
+        return _llm_key(settings) not in _JSON_MODE_OFF
+
+
+def _disable_json_mode(key: Tuple[str, str]) -> None:
+    with _JSON_MODE_LOCK:
+        first = key not in _JSON_MODE_OFF
+        _JSON_MODE_OFF.add(key)
+    if first:
+        logger.info(f"LLM: {key[1] or 'модель'} не поддерживает JSON-режим — "
+                    "дальше обычный ответ без response_format")
+
+
+def _model_is_warm(settings: Dict[str, Any]) -> bool:
+    with _WARM_LOCK:
+        return _llm_key(settings) in _WARMED_MODELS
+
+
+def _mark_model_warm(settings: Dict[str, Any]) -> None:
+    with _WARM_LOCK:
+        _WARMED_MODELS.add(_llm_key(settings))
+
+
+def _forget_model_warm(key: Tuple[str, str]) -> None:
+    with _WARM_LOCK:
+        _WARMED_MODELS.discard(key)
 
 
 def get_llm(settings: Dict[str, Any] | None = None, json_mode: bool = False):
     s = settings or load_settings()
     kwargs: Dict[str, Any] = {}
-    if json_mode and _JSON_MODE_SUPPORTED:
-        kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
+    if json_mode and _json_mode_enabled(s):
+        kwargs["model_kwargs"] = {"response_format": _JSON_RESPONSE_FORMAT}
     try:
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(
@@ -653,12 +724,18 @@ def _try_lm_load(settings: Dict[str, Any]) -> None:
 
 
 def warm_up_llm(settings: Dict[str, Any] | None = None, report: Any = None) -> bool:
-    """Дожидается загрузки модели по требованию и делает пробный запрос."""
+    """Дожидается загрузки модели и проверяет её пробным запросом.
+
+    Состояние loaded само по себе не доказательство: LM Studio могла выгрузить
+    модель. Успешный прогрев запоминается для пары «сервер + модель», поэтому
+    повторно на каждый документ пробный запрос не уходит.
+    """
     s = settings or load_settings()
-    state, _ = model_state(s)
-    if state == "loaded":
+    if _model_is_warm(s):
         return True
-    _try_lm_load(s)
+    state, _ = model_state(s)
+    if state != "loaded":
+        _try_lm_load(s)
     timeout = max(30, int(s.get("model_load_timeout", 600) or 600))
     llm = get_llm({**s, "request_timeout": timeout})
     if llm is None:
@@ -666,6 +743,8 @@ def warm_up_llm(settings: Dict[str, Any] | None = None, report: Any = None) -> b
     deadline = time.time() + timeout
     attempt = 0
     last = ""
+    # Если состояние врало про loaded, после первой ошибки попросим загрузку.
+    load_retry = state == "loaded"
     while True:
         attempt += 1
         if report:
@@ -673,11 +752,24 @@ def warm_up_llm(settings: Dict[str, Any] | None = None, report: Any = None) -> b
                    else f"Загрузка модели в LM Studio (попытка {attempt})")
         try:
             llm.invoke([("system", "Ответь одним словом."), ("human", "ping")])
+            _mark_model_warm(s)
             logger.info(f"LLM готова: {s.get('model')} (попытка {attempt})")
             return True
         except Exception as e:
-            last = str(e)
-            logger.warning(f"LLM загрузка, попытка {attempt}: {last[:200]}")
+            last = _llm_error_text(e)
+            logger.warning(f"LLM загрузка, попытка {attempt}: {last[:300]}")
+            status = _http_status_code(e)
+            retryable = (_is_model_loading_error(last)
+                         or status in (408, 429)
+                         or 500 <= status < 600)
+            if not retryable:
+                # 400/401/403/404/422 и т.п. повтором не лечатся: не ждём
+                # model_load_timeout впустую.
+                logger.error(f"LLM не готова: {last[:300]}")
+                return False
+            if load_retry:
+                load_retry = False
+                _try_lm_load(s)
             if time.time() >= deadline:
                 logger.error(f"LLM не загрузилась за {timeout} с: {last[:300]}")
                 return False
@@ -852,12 +944,108 @@ def _load_llm_json(raw: str) -> Any:
     return None
 
 
+# Подписи полей, которые модель иногда захватывает вместе со значением.
+# Список закрытый: произвольные слова и юридические формы (ООО, АО, ИП)
+# не отрезаются, иначе можно испортить название организации.
+_FIELD_LABELS = (
+    "инн/кпп", "огрн/инн", "огрнип", "огрн", "инн", "кпп", "бик", "снилс",
+    "расчетный счет", "корреспондентский счет", "корр. счет", "корсчет",
+    "банк получателя",
+    "паспорт гражданина рф", "паспорт",
+    "кем выдан", "дата выдачи", "код подразделения",
+    "адрес для корреспонденции", "юридический адрес", "почтовый адрес", "адрес",
+    "р/сч", "р/с", "к/сч", "к/с", "счет",
+    "серия", "номер документа", "номер",
+    "телефон", "тел.", "тел", "моб.", "моб", "факс",
+    "e-mail", "email", "сайт", "telegram", "whatsapp",
+    "сумма ндс", "сумма налога", "сумма", "стоимость", "цена", "ндс", "ндфл",
+    "дата документа", "дата рождения", "дата поставки", "дата оплаты", "дата",
+    "подпись", "№", "#",
+)
+_FIELD_LABELS = tuple(sorted(_FIELD_LABELS, key=len, reverse=True))
+# У этих подписей после отрезания остаётся не значение, а описание:
+# «дата договора 01.01.2020», «номер договора 15», «адрес места жительства».
+# Их отрезаем только если остаток действительно похож на значение (цифра,
+# «+», «@») или подпись отделена двоеточием. Иначе меняем строку целиком.
+_WEAK_LABELS = frozenset((
+    "дата", "дата документа", "дата рождения", "дата поставки", "дата оплаты",
+    "дата выдачи", "номер", "номер документа", "серия", "счет",
+    "сумма", "сумма ндс", "сумма налога", "стоимость", "цена", "ндс", "ндфл",
+    "адрес", "юридический адрес", "почтовый адрес", "адрес для корреспонденции",
+    "подпись", "код подразделения",
+))
+
+
+def _looks_like_value(core: str) -> bool:
+    head = core.lstrip()
+    return bool(head) and (head[0].isdigit() or head[0] in "+@" or head[0] == "(")
+# Роли и «банк» отрезаем только при явном двоеточии: «Поставщик: ООО …» —
+# подпись, а «Поставщик Сервис» — уже название организации.
+_COLON_LABELS = tuple(sorted(
+    ("поставщик", "покупатель", "заказчик", "исполнитель",
+     "получатель", "плательщик", "банк"), key=len, reverse=True))
+_FIELD_SEP = " \t\u00a0:№#."
+
+
+def _match_field_label(raw: str, low: str, labels: Tuple[str, ...],
+                       require_colon: bool) -> Tuple[str, str]:
+    for label in labels:
+        if not low.startswith(label):
+            continue
+        rest = raw[len(label):]
+        if require_colon:
+            after = rest.lstrip(" \t\u00a0")
+            if not after.startswith(":"):
+                continue
+            core = after[1:].lstrip(" \t\u00a0")
+        else:
+            # У «№» и «#» значение может идти сразу: «№15».
+            if (label not in ("№", "#") and rest
+                    and rest[0] not in _FIELD_SEP):
+                continue
+            core = rest.lstrip(_FIELD_SEP)
+            if (label in _WEAK_LABELS and not _looks_like_value(core)
+                    and not rest.lstrip(" \t\u00a0").startswith(":")):
+                continue
+        if core and not _is_bad_value(core):
+            return raw[:len(label)], core
+    return "", raw
+
+
+def _split_field_label(value: str) -> Tuple[str, str]:
+    """Отделяет известную подпись поля: «ИНН 7701234567» -> («ИНН», «7701234567»)."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "", ""
+    low = raw.lower().replace("ё", "е")
+    label, core = _match_field_label(raw, low, _FIELD_LABELS, False)
+    if label:
+        return label, core
+    return _match_field_label(raw, low, _COLON_LABELS, True)
+
+
+def _replacement_keeps_label(replacement: str, label: str) -> bool:
+    """Начинается ли замена с той же подписи (тогда меняем строку целиком)."""
+    head = _clean_value(replacement).lower().replace("ё", "е")
+    label = label.lower().replace("ё", "е")
+    if not head:
+        return False
+    if head.startswith(label):
+        return True
+    if label.endswith(".") and head.startswith(label[:-1]):
+        return True
+    if "-" in label and head.replace("-", "").startswith(label.replace("-", "")):
+        return True
+    first = re.split(r"[\s/]+", label, maxsplit=1)[0]
+    return len(first) >= 3 and head.startswith(first)
+
+
 def _locate_value(text: str, value: str, replacement: str = "") -> str:
     """Возвращает реальную подстроку документа для строки от модели.
 
-    Если модель захватила подпись поля («ИНН 7701234567»), подпись отрезается:
-    заменяется только значение. Если замена сама начинается с этой подписи,
-    значит это часть названия/значения — берём строку целиком.
+    Если модель захватила известную подпись поля («ИНН 7701234567»), подпись
+    отрезается: заменяется только значение. Если замена сама начинается с этой
+    подписи, значит это часть названия/значения — берём строку целиком.
     """
     value = str(value or "").strip()
     if not value:
@@ -875,21 +1063,18 @@ def _locate_value(text: str, value: str, replacement: str = "") -> str:
                 return text[idx[m.start()]: idx[m.end() - 1] + 1]
         return ""
 
-    found = ""
+    label, core = _split_field_label(cleaned or value)
+    # Слишком короткое значение после подписи («Номер 15») не отрезаем:
+    # иначе «15» начнёт заменяться по всему документу.
+    if (label and core and len(core) >= 3
+            and not _replacement_keeps_label(replacement, label)):
+        found = find(core)
+        if found:
+            return found
+
     for candidate in (value, cleaned, value.rstrip(".,;:!?»\"'"),
                       cleaned.rstrip(".,;:!?»\"'")):
         found = find(candidate)
-        if found:
-            break
-    if found:
-        return found
-    words = value.split()
-    head_replacement = _clean_value(replacement).lower()
-    for k in range(1, min(4, len(words))):
-        head = " ".join(words[:k]).lower()
-        if head and head_replacement.startswith(head):
-            continue
-        found = find(" ".join(words[k:]).strip(" ,;:"))
         if found:
             return found
     return ""
@@ -958,20 +1143,78 @@ def _parse_replacements(raw: str, chunk: str) -> Tuple[List[Dict[str, str]], Lis
     return accepted, invalid
 
 
-def _invoke(llm, messages: List[Any], retries: int) -> Tuple[str | None, str, bool]:
+def _invoke_uses_json_mode(llm: Any) -> bool:
+    kwargs = getattr(llm, "model_kwargs", None) or {}
+    return bool(kwargs.get("response_format"))
+
+
+def _http_status_code(exc: BaseException) -> int:
+    for source in (exc, getattr(exc, "response", None)):
+        code = getattr(source, "status_code", None)
+        try:
+            if code is not None:
+                return int(code)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _llm_error_text(exc: BaseException) -> str:
+    """Текст ошибки вместе с телом ответа сервера.
+
+    str() у ошибок OpenAI SDK содержит только «Error code: 400», поэтому
+    причина (например, отклонённый response_format) без тела ответа теряется.
+    """
+    text = str(exc).strip()
+    details: List[str] = []
+    body = getattr(exc, "body", None)
+    if body:
+        if isinstance(body, str):
+            details.append(body)
+        else:
+            try:
+                details.append(json.dumps(body, ensure_ascii=False))
+            except (TypeError, ValueError):
+                details.append(str(body))
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            details.append(response.text)
+        except Exception:
+            pass
+    for detail in details:
+        detail = str(detail or "").strip()
+        if detail and detail not in text:
+            text = f"{text}: {detail}" if text else detail
+            break
+    return text[:2000]
+
+
+def _invoke(llm, messages: List[Any], retries: int,
+            json_key: Tuple[str, str] | None = None) -> Tuple[str | None, str, bool]:
     """Запрос к модели. Третий элемент — «нужно повторить без json-режима»."""
-    global _JSON_MODE_SUPPORTED
     last = ""
+    key = json_key or ("", "")
     for attempt in range(2 + max(0, retries)):
         try:
             resp = llm.invoke(messages)
             return (resp.content if hasattr(resp, "content") else str(resp)), "", False
         except Exception as e:
-            last = str(e)
-            logger.warning(f"LLM запрос: {last[:200]}")
-            if "response_format" in last or "json_object" in last:
-                _JSON_MODE_SUPPORTED = False
+            last = _llm_error_text(e)
+            status = _http_status_code(e)
+            logger.warning(f"LLM запрос: {last[:300]}")
+            # Сервер отклонил сам формат ответа — это не сбой модели и не повод
+            # повторять тот же запрос: переключаемся на обычный текстовый ответ.
+            format_rejected = any(key_part in last for key_part in
+                                  ("response_format", "json_object", "json_schema"))
+            if format_rejected or (_invoke_uses_json_mode(llm) and status in (400, 415, 422)):
+                _disable_json_mode(key)
                 return None, last, True
+            if _is_model_loading_error(last) and not any(
+                    part in last.lower() for part in ("context", "too large")):
+                # Модель могла быть выгружена после прогрева: в следующий раз
+                # warm_up_llm сделает пробный запрос заново.
+                _forget_model_warm(key)
             if "context" in last.lower():
                 # Переполнение контекста лечится дроблением фрагмента, а не повтором.
                 return None, last, False
@@ -1023,10 +1266,13 @@ def _repair_replacements(llm, settings: Dict[str, Any], chunk: str,
         '{"replacements":[{"original":"...","replacement":"...","type":"..."}]}\n\n'
         f"{listing}"
     )
-    raw, _, plain = _invoke(llm, [("system", ANON_SYSTEM), ("human", prompt)], retries)
+    key = _llm_key(settings)
+    raw, _, plain = _invoke(llm, [("system", ANON_SYSTEM), ("human", prompt)],
+                            retries, key)
     if plain:
         llm = get_llm(settings, json_mode=False) or llm
-        raw, _, _ = _invoke(llm, [("system", ANON_SYSTEM), ("human", prompt)], retries)
+        raw, _, _ = _invoke(llm, [("system", ANON_SYSTEM), ("human", prompt)],
+                            retries, key)
     if not raw:
         return []
     parsed = _parse_replacements(raw, chunk)
@@ -1046,16 +1292,18 @@ def _request_replacements(llm, settings: Dict[str, Any], chunk: Dict[str, Any],
     prompt = (f"{_known_hint(known, text)}{label}. Ниже текст фрагмента. "
               f"Верни JSON с заменами:\n\n{text}")
     messages = [("system", ANON_SYSTEM), ("human", prompt)]
-    raw, error, plain = _invoke(llm, messages, retries)
+    key = _llm_key(settings)
+    raw, error, plain = _invoke(llm, messages, retries, key)
     if plain:
         llm = get_llm(settings, json_mode=False) or llm
-        raw, error, _ = _invoke(llm, messages, retries)
+        raw, error, _ = _invoke(llm, messages, retries, key)
     had_response = raw is not None
     parsed = _parse_replacements(raw, text) if raw else None
     if parsed is None and raw is not None:
         raw, error, _ = _invoke(
             llm, [("system", ANON_SYSTEM),
-                  ("human", prompt + "\n\nОтвет — только JSON-объект, без пояснений.")], 0)
+                  ("human", prompt + "\n\nОтвет — только JSON-объект, без пояснений.")],
+            0, key)
         parsed = _parse_replacements(raw, text) if raw else None
     if parsed is None:
         context_error = "context" in str(error or "").lower()
@@ -1165,6 +1413,11 @@ def _llm_failure_message(error: str) -> str:
     }
     if error in messages:
         return messages[error]
+    lowered = str(error or "").lower()
+    if any(key in lowered for key in ("error code: 4", "response_format",
+                                      "json_object", "json_schema")):
+        return ("LLM отклонила запрос (ошибка параметров) — обработка отменена"
+                + (f": {error[:200]}" if error else ""))
     return "LLM не отвечает — обработка отменена" + (f": {error[:200]}" if error else "")
 
 

@@ -148,7 +148,12 @@ def _collect_phrases() -> List[str]:
 
 def _run_document(text: str, phrases: List[str]) -> Tuple[List[List[str]], str]:
     """Один запрос на весь текст — как обработка одного документа сервисом."""
-    replacements, ok, error = processing.anonymize_text(text)
+    try:
+        replacements, ok, error = processing.anonymize_text(text)
+    except Exception as e:
+        # Сбой клиента/настроек не должен обрывать прогон без результата:
+        # показываем причину так же, как ошибку модели.
+        return [], f"{type(e).__name__}: {e}"
     if not ok:
         return [], processing._llm_failure_message(error)
     # Те же помощники, что используют process_pdf/process_docx/process_excel.
@@ -197,8 +202,9 @@ def main() -> int:
 
     for phrase, result in rows:
         print(f"{phrase} -> {result}")
-    print(f"\nГотово: {TEST_FILE}")
-    return 0 if not error else 1
+    failed = sum(1 for _, result in rows if str(result).startswith("ОШИБКА:"))
+    print(f"\nГотово: {TEST_FILE} | успешно: {len(rows) - failed}, ошибок: {failed}")
+    return 0 if not failed else 1
 
 
 if __name__ == "__main__":

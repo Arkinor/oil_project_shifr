@@ -7,7 +7,6 @@
   "request_timeout": 120,
   "model_load_timeout": 600,
   "llm_retries": 3,
-  "max_llm_chars": 0,
   "llm_chunk_chars": 3500,
   "llm_enabled": true,
   "ocr_lang": "rus+eng",
