@@ -25,8 +25,6 @@ STATE_DIR = DATA_DIR / "state"
 for d in (DATA_DIR, UPLOAD_DIR, OUTPUT_DIR, STATE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-IMAGE_EXTS = (".png", ".jpg", ".jpeg")
-
 SETTINGS_FILE = APP_DIR / "settings.json"
 USERS_FILE = DATA_DIR / "users.json"
 LOG_FILE = DATA_DIR / "activity.log"
@@ -48,7 +46,6 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "llm_retries": 3,
     "llm_chunk_chars": 3500,
     "llm_enabled": True,
-    "ocr_lang": "rus+eng",
     "max_upload_mb": 50,
     "host": "0.0.0.0",
     "port": 9321,

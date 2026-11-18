@@ -1,4 +1,4 @@
-"""main.py — веб-сервис обезличивания PDF/Word/Excel/изображений с локальной LLM.
+"""main.py — веб-сервис обезличивания PDF/Word/Excel с локальной LLM.
 
 Запуск:  python main.py
 Сборка:  build.bat  ->  dist/PIIMasker.exe
@@ -41,7 +41,7 @@ from pydantic import BaseModel
 
 import processing
 from auth import authenticate, ensure_users_file, get_current_user, load_users
-from config import (APP_DIR, BASE_DIR, IMAGE_EXTS, LOG_FILE, OUTPUT_DIR,
+from config import (APP_DIR, BASE_DIR, LOG_FILE, OUTPUT_DIR,
                     SERVER_LOG_FILE, _LOG_FORMAT, ensure_settings, load_settings,
                     logger)
 from processing import (check_llm, model_state, prune_history, recover_state,
@@ -120,9 +120,10 @@ def process(file: UploadFile = File(...), user: str = Depends(get_current_user))
                                  f"не найдена — загрузка не начата.{hint}")
     original = _safe_name(file.filename or "document")
     ext = Path(original).suffix.lower()
-    if ext not in (".pdf", ".xlsx", ".docx", ".doc", *IMAGE_EXTS):
-        raise HTTPException(400, "Поддерживаются PDF, Word (.doc/.docx), Excel (.xlsx), "
-                                 "PNG и JPG")
+    if ext not in (".pdf", ".xlsx", ".docx"):
+        raise HTTPException(400, "Поддерживаются PDF, Word (.docx) и Excel (.xlsx). "
+                                 "Файлы .doc сохраните как .docx, изображения "
+                                 "не принимаются: текст с картинок не распознаётся")
 
     max_mb = int(s.get("max_upload_mb", 50))
     content = file.file.read(max_mb * 1024 * 1024 + 1)
@@ -135,9 +136,7 @@ def process(file: UploadFile = File(...), user: str = Depends(get_current_user))
     uid = uuid.uuid4().hex[:12]
     job_id = uuid.uuid4().hex
     in_path = user_uploads(user) / f"{uid}_{original}"
-    # .doc нельзя перезаписать на месте: результат всегда .docx.
-    out_ext = ".docx" if ext == ".doc" else ext
-    out_base = f"masked_{uid}_{Path(original).stem}{out_ext}"
+    out_base = f"masked_{uid}_{Path(original).stem}{ext}"
     out_name = out_base
     out_path = user_outputs(user) / out_name
     in_path.write_bytes(content)
@@ -201,11 +200,7 @@ def download(filename: str, user: str = Depends(get_current_user)):
     media = {
         ".pdf": "application/pdf",
         ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ".doc": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
     }.get(Path(name).suffix.lower(), "application/octet-stream")
     logger.info(f"DOWNLOAD | {user} | {name}")
     return FileResponse(path, media_type=media, filename=name)

@@ -10,4 +10,3 @@ openai==3.46.0
 pyinstaller==6.11.1
 pystray>=0.19
 pillow>=10.0
-pytesseract>=0.3.13

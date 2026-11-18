@@ -2,16 +2,15 @@
 
 Весь текст документа отправляется в LM Studio по частям с картой мест, модель
 возвращает пары original/replacement, а замены применяются к исходной разметке
-PDF, Word, Excel и изображений.
+PDF, Word и Excel. Изображения (печати, подписи, логотипы) не распознаются,
+а удаляются из результата: иначе название организации или подпись остались бы
+на картинке.
 """
-import base64
 import hashlib
 import json
 import math
 import os
 import re
-import shutil
-import subprocess
 import threading
 import time
 import urllib.parse
@@ -23,8 +22,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from config import (IMAGE_EXTS, MASK_LOG_FILE, OUTPUT_DIR, STATE_DIR,
-                    UPLOAD_DIR, load_settings, logger)
+from config import (MASK_LOG_FILE, OUTPUT_DIR, STATE_DIR, UPLOAD_DIR,
+                    load_settings, logger)
 
 
 # ================================================================
@@ -248,16 +247,14 @@ def _run_job(job_id: str, in_path: Path, out_path: Path, ext: str) -> None:
             if ext == ".pdf":
                 result = process_pdf(in_path, out_path, progress=report,
                                      user=owner, filename=source_name)
-            elif ext in IMAGE_EXTS:
-                result = process_image(in_path, out_path, progress=report,
-                                       user=owner, filename=source_name)
-            elif ext in (".docx", ".doc"):
-                result = (process_doc if ext == ".doc" else process_docx)(
-                    in_path, out_path, progress=report,
-                    user=owner, filename=source_name)
-            else:
+            elif ext == ".docx":
+                result = process_docx(in_path, out_path, progress=report,
+                                      user=owner, filename=source_name)
+            elif ext == ".xlsx":
                 result = process_excel(in_path, out_path, progress=report,
                                        user=owner, filename=source_name)
+            else:
+                raise RuntimeError(f"Формат {ext} не поддерживается")
             logger.info(f"PROCESS_DONE | job={job_id} | {in_path.name} | "
                         f"{round(time.time() - started, 1)} s | "
                         f"masked={result.get('masked')} | llm_used={result.get('llm_used')}")
@@ -956,6 +953,20 @@ def warm_up_llm(settings: Dict[str, Any] | None = None, report: Any = None) -> b
             time.sleep(min(15, 2 * attempt))
 
 
+def _is_length_limit_error(message: str) -> bool:
+    """Модель упёрлась в лимит вывода, а не сломалась.
+
+    LangChain при обрезанном ответе выбрасывает исключение «Could not parse
+    response content as the length limit was reached». Повтор того же запроса
+    даст тот же обрыв: фрагмент нужно дробить, как при переполнении контекста.
+    """
+    text = str(message or "").lower()
+    return any(key in text for key in (
+        "length limit", "finish reason: length", "finish_reason: length",
+        "finish_reason=length", "maximum context length of the output",
+        "max_tokens", "max tokens"))
+
+
 def _is_model_loading_error(message: str) -> bool:
     m = str(message or "").lower().replace("_", " ")
     return any(k in m for k in ("loading", "not loaded", "unloaded", "no model",
@@ -978,56 +989,22 @@ def _prepare_llm(report: Any = None) -> None:
 
 
 ANON_SYSTEM = (
-    "Ты — система обезличивания документов. Тебе дают ОДИН фрагмент документа "
-    "(договор, счёт, акт, таблица, письмо) и метку, откуда он взят. "
-    "Найди в нём чувствительные данные и верни замены.\n"
-    "Формат ответа — ровно один JSON-объект, без markdown и пояснений:\n"
+    "Ты обезличиваешь фрагмент документа. Ответ — один JSON-объект:\n"
     '{"replacements":[{"original":"точная подстрока фрагмента",'
-    '"replacement":"другое правдоподобное значение","type":"тип"}]}\n'
-    'Если менять нечего — верни {"replacements": []}.\n\n'
-    "ЧУВСТВИТЕЛЬНЫЕ ДАННЫЕ:\n"
-    "— ФИО полностью и по частям: фамилия, имя, отчество, инициалы в любом порядке; "
-    "ФИО в верхнем регистре, в кавычках, латиницей; ФИО в подписях и расшифровках, "
-    "в том числе сразу после линии подчёркивания («___Иванов И.И.») и рядом с «М.П.»;\n"
-    "— организации: полные юридические формы и краткие названия, бренды, "
-    "аббревиатуры (ООО, АО, ПАО, ИП и т.п. вместе с названием), банки;\n"
-    "— адреса целиком и по частям: страна, регион, город, улица, дом, корпус, "
-    "квартира/офис, индекс; адреса латиницей;\n"
-    "— телефоны, email, сайты, мессенджеры;\n"
-    "— ИНН, КПП, ОГРН/ОГРНИП, СНИЛС, паспорт, БИК, расчётные и корреспондентские счета;\n"
-    "— суммы, цены, НДС, авансы, штрафы, пени — цифрами и прописью;\n"
-    "— даты (документа, рождения, поставки, оплаты) и сроки/гарантии;\n"
-    "— должности, подписи и расшифровки подписей;\n"
-    "— конкретные наименования товаров, работ и услуг в таблицах и тексте.\n\n"
-    "НЕ МЕНЯЙ:\n"
-    "— подписи полей и заголовки: «Поставщик», «Покупатель», «Заказчик», "
-    "«Исполнитель», «ИНН», «КПП», «БИК», «Расчётный счёт», «Банк получателя», "
-    "«Адрес», «Телефон», «Наименование», «Количество», «Ед. изм.», «Цена», "
-    "«Сумма», «Итого», «Дата», «Номер», «Период», «Подпись», «М.П.»;\n"
-    "— места для подписи, прочерки, линии и пустые графы: если значения нет — "
-    "ничего не возвращай;\n"
-    "— служебные слова, номера пунктов, названия разделов и колонок.\n\n"
-    "КАК ЗАПОЛНЯТЬ ЗАМЕНУ:\n"
-    "1. original — подстрока фрагмента символ в символ, без подписи поля: "
-    "«7701234567», а не «ИНН 7701234567». Одно значение — одна пара. "
-    "Если подпись всё же вошла в original, начни replacement с той же подписи.\n"
-    "2. replacement — обязательно ДРУГОЕ правдоподобное значение того же вида: "
-    "у чисел та же длина и разделители, у дат тот же формат, у телефона и счёта "
-    "тот же шаблон, у названия та же юридическая форма и кавычки, у ФИО тот же "
-    "порядок слов и пол. Сохраняй регистр, валюту и единицы измерения.\n"
-    "3. Думай о роли значения. Подпись руководителя — другое ФИО; название "
-    "товара — другое название; город — другой город. Не ставь имя на место "
-    "должности или организации и наоборот.\n"
-    "4. Указывай все варианты одного значения во фрагменте: полное ФИО и "
-    "краткое «Фамилия И.О.», отдельную фамилию, полное и краткое название, "
-    "адрес и его части, сумму цифрами и прописью.\n"
-    "5. original должен быть достаточно длинным и однозначным. Не возвращай "
-    "отдельные цифры, буквы и общие слова.\n"
-    "6. Если фрагмент начинается или заканчивается посреди значения — не угадывай: "
-    "верни только то, что видно целиком и однозначно.\n"
-    "7. Если в сообщении есть список согласованных замен — используй для этих "
-    "значений те же replacement.\n"
-    "8. Экранируй кавычки и переводы строк по правилам JSON."
+    '"replacement":"другое значение","type":"ФИО"}]}\n'
+    "type — одно из: ФИО, организация, адрес, телефон, email, сайт, реквизит, "
+    "дата, сумма, товар, должность, другое.\n"
+    "Меняй: ФИО и инициалы, организации и банки, адреса, телефоны, email, сайты, "
+    "ИНН/КПП/ОГРН/БИК/счета/паспорт/СНИЛС, суммы, даты, названия товаров, "
+    "должности.\n"
+    "original — минимальное значение без подписи поля и без служебных слов "
+    "(«ИНН», «Банк», «программа», «г.»). Одна пара на значение.\n"
+    "replacement — другое правдоподобное значение той же формы: длина, формат, "
+    "падеж, пол, кавычки, регистр.\n"
+    "Не меняй подписи полей, заголовки, номера пунктов, роли (Лицензиар, "
+    "Лицензиат, Поставщик, Покупатель, Стороны), прочерки и пустые графы.\n"
+    'Если менять нечего — {"replacements": []}.\n'
+    "Экранируй кавычки и переводы строк по правилам JSON."
 )
 
 
@@ -1396,11 +1373,22 @@ def _invoke(llm, messages: List[Any], retries: int,
     for attempt in range(2 + max(0, retries)):
         try:
             resp = llm.invoke(messages)
-            return (resp.content if hasattr(resp, "content") else str(resp)), "", False
+            content = resp.content if hasattr(resp, "content") else str(resp)
+            meta = getattr(resp, "response_metadata", None) or {}
+            finish = str(meta.get("finish_reason") or
+                         meta.get("stop_reason") or "").strip().lower()
+            if finish == "length":
+                # Сервер вернул обрезанный ответ без исключения: JSON заведомо
+                # неполный. Отдаём наверх как ошибку лимита, чтобы фрагмент
+                # раздробили, а не отменили обработку.
+                return None, "length limit reached (finish_reason=length)", False
+            return content, "", False
         except Exception as e:
             last = _llm_error_text(e)
             status = _http_status_code(e)
             logger.warning(f"LLM запрос: {last[:300]}")
+            if _is_length_limit_error(last):
+                return None, last, False
             # Сервер отклонил сам формат ответа — это не сбой модели и не повод
             # повторять тот же запрос: переключаемся на обычный текстовый ответ.
             format_rejected = any(key_part in last for key_part in
@@ -1504,20 +1492,28 @@ def _request_replacements(llm, settings: Dict[str, Any], chunk: Dict[str, Any],
             0, key)
         parsed = _parse_replacements(raw, text) if raw else None
     if parsed is None:
-        context_error = "context" in str(error or "").lower()
-        if depth < 2 and len(text) > 1200 and (had_response or context_error):
+        reason = str(error or "").lower()
+        context_error = "context" in reason
+        truncated = _is_length_limit_error(reason)
+        if depth < 3 and len(text) > 400 and (
+                had_response or context_error or truncated):
             halves = _split_long(text, 0, len(text), chunk.get("place") or label,
-                                 max(800, len(text) // 2), CHUNK_OVERLAP)
+                                 max(600, len(text) // 2), CHUNK_OVERLAP)
             combined: List[Dict[str, str]] = []
+            seen: set[str] = set()
             for part_index, half in enumerate(halves):
                 part = {"text": text[half["start"]:half["end"]],
                         "label": f"{label}.{part_index + 1}", "place": chunk.get("place")}
                 got, error = _request_replacements(llm, settings, part, known, retries, depth + 1)
                 if got is None:
                     return None, error
-                combined.extend(got)
                 for item in got:
-                    known.setdefault(item["original"].lower(), (item["original"], item["replacement"]))
+                    # Перекрытие соседних частей даёт те же значения дважды.
+                    key = item["original"].lower()
+                    if key not in seen:
+                        seen.add(key)
+                        combined.append(item)
+                    known.setdefault(key, (item["original"], item["replacement"]))
             return combined, ""
         logger.warning(f"LLM {label}: ответ без корректных замен")
         return None, error or "invalid_json"
@@ -1567,6 +1563,9 @@ def anonymize_text(text: str,
     chunks = _chunk_document(text, bounded, size, CHUNK_OVERLAP)
     retries = max(0, int(s.get("llm_retries", 3) or 0))
     known: Dict[str, Tuple[str, str]] = {}
+    known_keys: set[str] = set()
+    org_names: Dict[str, str] = {}
+    brand_names: Dict[str, str] = {}
     replacements: List[Dict[str, str]] = []
     processed = 0
     total = len(chunks)
@@ -1590,10 +1589,22 @@ def anonymize_text(text: str,
         added = 0
         new_items: List[Dict[str, str]] = []
         for item in got:
+            item["original"] = _trim_signature_line(item["original"])
+            item["replacement"] = _trim_signature_line(item["replacement"])
+            item["replacement"] = _model_structured_replacement(
+                item["original"], item["replacement"],
+                str(item.get("type") or ""))
+            item["replacement"] = _canonical_org(
+                item["original"], item["replacement"],
+                str(item.get("type") or ""), org_names)
+            item["replacement"] = _canonical_brand(
+                item["original"], item["replacement"],
+                str(item.get("type") or ""), brand_names)
             key = item["original"].lower()
             if key in known:
                 continue
             known[key] = (item["original"], item["replacement"])
+            known_keys.add(_mask_key(item["original"]))
             replacements.append(item)
             new_items.append(item)
             added += 1
@@ -1616,6 +1627,21 @@ def anonymize_text(text: str,
         logger.error(f"LLM | {filename or 'документ'}: модель не нашла ни одной "
                      f"замены ({len(text)} символов, {total} фрагментов)")
         return [], False, "no_replacements"
+
+    # Страховка по форматам: модель могла пропустить реквизиты в плотном
+    # фрагменте. Добавляем только те значения, для которых пары ещё нет.
+    structured = _structured_pairs(text, known_keys)
+    if structured:
+        for item in structured:
+            key = _mask_key(item["original"])
+            if key in known_keys:
+                continue
+            known_keys.add(key)
+            replacements.append(item)
+        _append_mask_log(user, filename, structured, page="проверка по форматам")
+        logger.info(f"REGEX | {filename or 'документ'}: добавлено {len(structured)} "
+                    f"замен, которых не было в ответе модели")
+
     logger.info(f"LLM | готово: {len(replacements)} замен, обработано {processed} символов")
     return replacements, True, ""
 
@@ -1633,6 +1659,9 @@ def _llm_failure_message(error: str) -> str:
     }
     if error in messages:
         return messages[error]
+    if _is_length_limit_error(error):
+        return ("Модель не смогла уложить ответ в лимит вывода — обработка "
+                "отменена, файл не выдан. Повторите обработку")
     lowered = str(error or "").lower()
     if any(key in lowered for key in ("error code: 4", "response_format",
                                       "json_object", "json_schema")):
@@ -1664,6 +1693,69 @@ def _name_initials(parts: List[str]) -> str:
     return ".".join(letters) + "." if len(letters) == 2 else ""
 
 
+def _person_name_tokens(value: str) -> List[str]:
+    """Только ФИО из строки вида «бухгалтера Капишниковой Марины Валерьевны».
+
+    Модель часто включает в original должность. Если взять первые три слова,
+    основа фамилии получится из «бухгалтера», и в подписи появится мусор вроде
+    «бухгалтерая К.М.». ФИО — непрерывный блок слов с заглавной буквы.
+    """
+    tokens = _clean_value(value).split()
+    runs: List[List[str]] = []
+    current: List[str] = []
+    for token in tokens:
+        if token[:1].isupper():
+            current.append(token)
+        else:
+            if current:
+                runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+    # Должность («Генерального директора») — отдельный короткий блок, ФИО —
+    # последний блок из трёх и более слов.
+    for run in reversed(runs):
+        if len(run) >= 3:
+            return run[:3]
+    return tokens[-3:] if len(tokens) >= 3 else []
+
+
+def _given_name_forms(name: str) -> List[str]:
+    """Именительный падеж имени: «Дмитрия» -> «Дмитрий», «Анны» -> «Анна»."""
+    name = _clean_value(name)
+    if not name:
+        return []
+    forms = [name]
+    low = name.lower()
+    if low.endswith("ия"):
+        forms.append(name[:-2] + "ий")
+    elif low.endswith("ея"):
+        forms.append(name[:-2] + "ей")
+    elif low.endswith("ы"):
+        forms.append(name[:-1] + "а")
+    elif low.endswith("и"):
+        forms.append(name[:-1] + "а")
+        forms.append(name[:-1] + "я")
+    elif (low.endswith("я") and len(name) >= 2
+          and name[-2].lower() not in "аеёиоуыэюяь"):
+        forms.append(name[:-1] + "ь")
+    return list(dict.fromkeys(forms))
+
+
+def _patronymic_forms(name: str) -> List[str]:
+    """Именительный падеж отчества: «Ринатовича» -> «Ринатович»."""
+    name = _clean_value(name)
+    if not name:
+        return []
+    forms = [name]
+    low = name.lower()
+    if low.endswith("ича"):
+        forms.append(name[:-1])
+    elif low.endswith("ы"):
+        forms.append(name[:-1] + "а")
+    return list(dict.fromkeys(forms))
+
+
 def _signature_pairs(original: str, replacement: str,
                      kind: str = "") -> List[Tuple[str, str]]:
     """Короткие ФИО для подписей: «Капишникова М.В.» из полного ФИО.
@@ -1675,8 +1767,8 @@ def _signature_pairs(original: str, replacement: str,
     if not any(tag in str(kind).lower()
                for tag in ("фио", "физ", "person", "name")):
         return []
-    orig = _clean_value(original).split()
-    fake = _clean_value(replacement).split()
+    orig = _person_name_tokens(original)
+    fake = _person_name_tokens(replacement)
     if len(orig) < 3 or len(fake) < 3:
         return []
     o_init = _name_initials(orig[1:])
@@ -1691,17 +1783,729 @@ def _signature_pairs(original: str, replacement: str,
     # женскую замену. Мужская форма — основа без окончания.
     forms = [
         (f"{o_stem}а {o_init}", f"{f_stem}а {f_init}"),
-        (f"{o_stem}ая {o_init}", f"{f_stem}а {f_init}"),
         (f"{o_stem} {o_init}", f"{f_stem} {f_init}"),
         (f"{orig[0]} {o_init}", f"{fake[0]} {f_init}"),
     ]
+    # Полное ФИО в именительном падеже: сертификат подписи часто содержит
+    # «Капишникова Марина Валерьевна», а модель вернула только «...Марины
+    # Валерьевны» из преамбулы. Формы строятся для всех слов, поэтому в
+    # документе закрывается и прямой, и косвенный падеж.
+    o_givens = _given_name_forms(orig[1])
+    f_givens = _given_name_forms(fake[1])
+    o_patronymics = _patronymic_forms(orig[2])
+    f_patronymics = _patronymic_forms(fake[2])
+    for i, given in enumerate(o_givens):
+        for j, patronymic in enumerate(o_patronymics):
+            f_given = f_givens[min(i, len(f_givens) - 1)]
+            f_patronymic = f_patronymics[min(j, len(f_patronymics) - 1)]
+            forms.append((f"{o_stem}а {given} {patronymic}",
+                          f"{f_stem}а {f_given} {f_patronymic}"))
+            forms.append((f"{o_stem} {given} {patronymic}",
+                          f"{f_stem} {f_given} {f_patronymic}"))
     result: List[Tuple[str, str]] = []
     seen = set()
     for short, short_fake in forms:
-        if short not in seen:
-            seen.add(short)
+        key = _mask_key(short)
+        if key and key not in seen:
+            seen.add(key)
             result.append((short, short_fake))
     return result
+
+
+_ORG_FULL_FORMS = {
+    "общество с ограниченной ответственностью": "ООО",
+    "акционерное общество": "АО",
+    "публичное акционерное общество": "ПАО",
+    "закрытое акционерное общество": "ЗАО",
+}
+_ORG_FULL_BY_SHORT = {short: full for full, short in _ORG_FULL_FORMS.items()}
+_ORG_ANY_RE = re.compile(
+    r"\b(?:(?P<full>Общество\s+с\s+ограниченной\s+ответственностью|"
+    r"Публичное\s+акционерное\s+общество|"
+    r"Закрытое\s+акционерное\s+общество|"
+    r"Акционерное\s+общество)|(?P<short>ООО|ОАО|ПАО|ЗАО|АО))\b"
+    r"\s*(?P<core>.+)$", re.I | re.S)
+
+
+def _strip_quotes(value: str) -> str:
+    return str(value or "").strip().strip(_QUOTE_MARKS).strip()
+
+
+def _org_parse(value: str) -> Tuple[str, str, str]:
+    """Аббревиатура, название и как форма записана в тексте.
+
+    «компания ООО «Ромашка»» -> (ООО, Ромашка, «ООО»), потому что юридическая
+    форма может стоять не в начале строки: модель иногда захватывает слово
+    «компания» или «организация».
+    """
+    text = _clean_value(value)
+    match = _ORG_ANY_RE.search(text)
+    if not match:
+        return "", "", ""
+    if match.group("full"):
+        form_text = re.sub(r"\s+", " ", match.group("full"))
+        short = _ORG_FULL_FORMS.get(form_text.lower(), "")
+    else:
+        form_text = match.group("short")
+        short = form_text.upper()
+    return short, _strip_quotes(match.group("core")), form_text
+
+
+def _org_core(value: str) -> Tuple[str, str]:
+    """Аббревиатура и название без кавычек: «ООО «Ромашка»» -> (ООО, Ромашка)."""
+    short, core, _ = _org_parse(value)
+    return short, core
+
+
+def _phrase_re(text: str) -> str:
+    """Регулярка по фразе: пробелы и переводы строк считаются одним пробелом."""
+    return r"\s+".join(re.escape(part) for part in text.split())
+
+
+_ORG_KIND_TAGS = ("орг", "компан", "фирм", "наимен", "org")
+
+
+def _canonical_org(original: str, replacement: str, kind: str,
+                   cache: Dict[str, str]) -> str:
+    """Одна организация — одно подставное название во всём документе.
+
+    Модель обрабатывает фрагменты по отдельности и может дать «ООО „ДССЛ“»
+    одно имя, а полному названию — другое. Тогда в договоре появляются две
+    разные организации. Первое согласованное имя становится каноническим,
+    остальные пары переписываются на него. Юридическая форма и кавычки
+    остаются такими, как в original.
+    """
+    if not any(tag in str(kind).lower() for tag in _ORG_KIND_TAGS):
+        return replacement
+    o_short, o_core, o_form = _org_parse(original)
+    f_short, f_core, f_form = _org_parse(replacement)
+    if not o_core or not f_core:
+        return replacement
+    key = _mask_key(o_core)
+    if not key:
+        return replacement
+    canonical = cache.setdefault(key, f_core)
+    result = replacement
+    if canonical != f_core:
+        result = re.sub(_phrase_re(f_core), lambda _m: canonical,
+                        result, count=1, flags=re.I)
+    if o_short and f_short and o_short != f_short and o_form and f_form:
+        # Модель сменила ООО на АО — возвращаем исходную юридическую форму.
+        result = re.sub(_phrase_re(f_form), lambda _m: o_form,
+                        result, count=1, flags=re.I)
+    return result
+
+
+def _org_pairs(original: str, replacement: str,
+               kind: str = "") -> List[Tuple[str, str]]:
+    """Сокращённые и полные названия организации получают одну замену.
+
+    Модель может вернуть полное название в одном фрагменте, а «ООО „ДССЛ“» —
+    в другом, с другим подставным именем. Тогда в документе оказываются две
+    разные организации. Производные пары строятся из уже согласованной пары.
+    """
+    if not any(tag in str(kind).lower() for tag in _ORG_KIND_TAGS):
+        return []
+    o_short, o_core = _org_core(original)
+    f_short, f_core = _org_core(replacement)
+    if not o_core or not f_core or not o_short or not f_short:
+        return []
+    forms: List[Tuple[str, str]] = []
+    if o_short in _ORG_FULL_BY_SHORT:
+        # original — полное название: добавляем ходовые краткие формы.
+        forms.extend([
+            (f"{o_short} «{o_core}»", f"{f_short} «{f_core}»"),
+            (f'{o_short} "{o_core}"', f'{f_short} "{f_core}"'),
+        ])
+    if o_short not in _ORG_FULL_BY_SHORT:
+        # original — аббревиатура: закрываем полное название, если оно встретится.
+        full = _ORG_FULL_BY_SHORT.get(o_short)
+        if full:
+            full_fake = _ORG_FULL_BY_SHORT.get(f_short)
+            if full_fake:
+                forms.append((f"{full} «{o_core}»",
+                              f"{full_fake} «{f_core}»"))
+    result: List[Tuple[str, str]] = []
+    seen: set[str] = set()
+    for short, short_fake in forms:
+        key = _mask_key(short)
+        if key and key != _mask_key(original) and key not in seen:
+            seen.add(key)
+            result.append((short, short_fake))
+    return result
+
+
+_BRAND_KIND_TAGS = ("товар", "наимен", "продукт", "программ", "услуг")
+_BRAND_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_.-]{3,}(?![A-Za-z0-9_])")
+_BRAND_STOP = {"http", "https", "www", "email", "mail", "file", "user",
+               "pdf", "docx", "xlsx", "gmt", "utc", "online", "support"}
+
+
+def _brand_tokens(value: str) -> List[str]:
+    out: List[str] = []
+    for token in _BRAND_TOKEN_RE.findall(value or ""):
+        if not any(ch.isupper() for ch in token):
+            continue
+        if token.lower().strip(".") in _BRAND_STOP:
+            continue
+        if token not in out:
+            out.append(token)
+    return out
+
+
+def _brand_pairs(original: str, replacement: str,
+                 kind: str) -> List[Tuple[str, str]]:
+    """Название продукта латиницей получает одну замену во всех местах.
+
+    Модель иногда захватывает всю фразу («Программный продукт — программа
+    TRASSIR для подключения IP-видеокамер»), а в других местах стоит только
+    «TRASSIR». Без производной пары настоящее название остаётся в тексте
+    рядом с подставным. Связываем названия, только если в original и в
+    replacement есть ровно по одному латинскому слову.
+    """
+    if not any(tag in str(kind).lower() for tag in _BRAND_KIND_TAGS):
+        return []
+    before = _brand_tokens(original)
+    after = _brand_tokens(replacement)
+    if len(before) != 1 or len(after) != 1:
+        return []
+    if before[0].lower() == after[0].lower():
+        return []
+    return [(before[0], after[0])]
+
+
+def _canonical_brand(original: str, replacement: str, kind: str,
+                     cache: Dict[str, str]) -> str:
+    """Одно название продукта — одно подставное имя во всём документе.
+
+    Модель может вернуть «Программа TRASSIR» -> «Программа VisionLink» и
+    «программе TRASSIR» -> «программе VISIONLINK». Оба варианта закрывают
+    оригинал, но выглядят как разные продукты. Первое согласованное имя
+    становится каноническим.
+    """
+    result = replacement
+    for brand, fake in _brand_pairs(original, replacement, kind):
+        key = _mask_key(brand)
+        if not key:
+            continue
+        canonical = cache.setdefault(key, fake)
+        if canonical != fake:
+            result = re.sub(_phrase_re(fake), lambda _m: canonical,
+                            result, count=1, flags=re.I)
+    return result
+
+
+def _hash_digits(seed: str, count: int) -> str:
+    """Детерминированные цифры: одно и то же значение -> одна и та же замена."""
+    out: List[str] = []
+    block = 0
+    while len(out) < count:
+        digest = hashlib.sha256(f"{seed}#{block}".encode("utf-8")).digest()
+        out.extend(str(byte % 10) for byte in digest)
+        block += 1
+    return "".join(out[:count])
+
+
+def _inn_valid(value: str) -> bool:
+    if len(value) == 10:
+        weights = (2, 4, 10, 3, 5, 9, 4, 6, 8)
+        return value[9] == str(sum(int(d) * w for d, w in zip(value[:9], weights)) % 11 % 10)
+    if len(value) == 12:
+        w11 = (7, 2, 4, 10, 3, 5, 9, 4, 6, 8)
+        w12 = (3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8)
+        d11 = str(sum(int(d) * w for d, w in zip(value[:10], w11)) % 11 % 10)
+        d12 = str(sum(int(d) * w for d, w in zip(value[:11], w12)) % 11 % 10)
+        return value[10:] == d11 + d12
+    return False
+
+
+def _ogrn_valid(value: str) -> bool:
+    if len(value) == 13:
+        return int(value[:12]) % 11 % 10 == int(value[12])
+    if len(value) == 15:
+        return int(value[:14]) % 13 % 10 == int(value[14])
+    return False
+
+
+def _fake_inn(value: str) -> str:
+    if len(value) == 10:
+        base = _hash_digits("inn:" + value, 9)
+        base = ("1" + base[1:]) if base[0] == "0" else base
+        weights = (2, 4, 10, 3, 5, 9, 4, 6, 8)
+        return base + str(sum(int(d) * w for d, w in zip(base, weights)) % 11 % 10)
+    base = _hash_digits("inn:" + value, 10)
+    base = ("1" + base[1:]) if base[0] == "0" else base
+    w11 = (7, 2, 4, 10, 3, 5, 9, 4, 6, 8)
+    w12 = (3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8)
+    d11 = str(sum(int(d) * w for d, w in zip(base, w11)) % 11 % 10)
+    base11 = base + d11
+    d12 = str(sum(int(d) * w for d, w in zip(base11, w12)) % 11 % 10)
+    return base11 + d12
+
+
+def _fake_ogrn(value: str) -> str:
+    base = _hash_digits("ogrn:" + value, len(value) - 1)
+    base = ("1" + base[1:]) if base[0] == "0" else base
+    mod = 11 if len(value) == 13 else 13
+    return base + str(int(base) % mod % 10)
+
+
+def _fake_snils(value: str) -> str:
+    base = _hash_digits("snils:" + value, 9)
+    total = sum(int(d) * (9 - i) for i, d in enumerate(base))
+    if total < 100:
+        check = total
+    elif total in (100, 101):
+        check = 0
+    else:
+        check = total % 101
+        if check == 100:
+            check = 0
+    digits = f"{base[:3]}-{base[3:6]}-{base[6:9]} {check:02d}"
+    return digits
+
+
+def _fake_account(value: str) -> str:
+    base = _hash_digits("acc:" + value, len(value))
+    # Первая цифра счёта задаёт вид: 3 — корреспондентский, 4 — расчётный.
+    first = value[0] if value[:1] in ("3", "4") else ("3" if base[0] in "01234" else "4")
+    result = first + base[1:]
+    if result == value:
+        result = ("4" if first == "3" else "3") + result[1:]
+    return result
+
+
+def _fake_kpp(value: str) -> str:
+    base = _hash_digits("kpp:" + value, 9)
+    base = ("1" + base[1:]) if base[0] == "0" else base
+    return base
+
+
+def _fake_bik(value: str) -> str:
+    return "04" + _hash_digits("bik:" + value, 7)
+
+
+def _fake_okpo(value: str) -> str:
+    base = _hash_digits("okpo:" + value, len(value))
+    return ("1" + base[1:]) if base[0] == "0" else base
+
+
+def _fake_phone(value: str) -> str:
+    stream = iter(_hash_digits("phone:" + value, 14))
+    first = value.strip()[:1]
+    head = "7" if first in ("+", "7") else "8"
+    out: List[str] = []
+    seen_digit = False
+    for ch in value:
+        if ch.isdigit():
+            if not seen_digit:
+                out.append(head)
+                seen_digit = True
+            else:
+                out.append(next(stream, "0"))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _fake_email(value: str) -> str:
+    return "user" + _hash_digits("email:" + value.lower(), 6) + "@example.com"
+
+
+def _fake_uuid(value: str) -> str:
+    """UUID той же разметки: дефисы и переносы сохраняются."""
+    compact = re.sub(r"[\s-]", "", value)
+    digest = hashlib.sha256(("uuid:" + compact.lower()).encode("utf-8")).hexdigest()
+    letters = iter(digest[:len(compact)])
+    upper = compact.isupper()
+    out: List[str] = []
+    for ch in value:
+        if ch.isalnum():
+            piece = next(letters, "0")
+            out.append(piece.upper() if upper else piece)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _fake_hex_id(value: str) -> str:
+    """Серийные номера сертификатов: та же длина и разбиение на строки."""
+    compact = re.sub(r"\s+", "", value)
+    digest = hashlib.sha256(("hex:" + compact.lower()).encode("utf-8")).hexdigest()
+    digest = (digest * ((len(compact) // len(digest)) + 1))[:len(compact)]
+    upper = compact.isupper()
+    out: List[str] = []
+    pos = 0
+    for part in re.findall(r"\s+|[0-9A-Fa-f]+", value):
+        if part.isspace():
+            out.append(part)
+            continue
+        chunk = digest[pos:pos + len(part)]
+        pos += len(part)
+        out.append(chunk.upper() if upper else chunk)
+    return "".join(out)
+
+
+def _fake_url(value: str) -> str:
+    scheme = "https" if value.lower().startswith("https") else "http"
+    return f"{scheme}://example.com/{_hash_digits('url:' + value, 8)}"
+
+
+_ADDRESS_CITIES = ("г. Москва", "г. Санкт-Петербург", "г. Казань",
+                   "г. Екатеринбург", "г. Новосибирск")
+_ADDRESS_STREETS = ("ул. Центральная", "ул. Садовая", "ул. Заречная",
+                    "ул. Полевая", "ул. Лесная")
+_ADDRESS_STREET_RE = re.compile(
+    r"(?i)\b(?:ул\.?|улица|пр-?т|проспект|пер\.|переулок|наб\.|"
+    r"набережная|шоссе)\b")
+_ADDRESS_REGION_RE = re.compile(
+    r"(?i)\b(?:обл\.|область|край|район|г\.|город|с\.|село|дер\.|деревня)\b")
+_ADDRESS_UNIT_RE = re.compile(
+    r"(?i)\b(?:комната|кв\.|квартира|офис|помещени\w*|этаж|корп\.|"
+    r"строени\w*|стр\.)\b")
+_ADDRESS_HINT_RE = re.compile(
+    r"(?i)\b(?:г\.|город|обл\.|область|край|район|ул\.?|улица|пр-?т|"
+    r"проспект|пер\.|переулок|наб\.|набережная|шоссе|дом|кв\.|комната|"
+    r"офис|помещени|стр\.|корп\.|с\.|село|дер\.|деревня)\b")
+_ADDRESS_LABEL_RE = re.compile(
+    r"(?i)^(?P<label>Юр(?:идический)?\.?\s*адрес|Фактический\s+адрес|"
+    r"Почтовый\s+адрес|Адрес\s+места\s+нахождения|Место\s+нахождения)"
+    r"\s*:\s*")
+_ADDRESS_FIELD_RE = re.compile(
+    r"(?i)^(?:Юр(?:идический)?\.?\s*адрес|ИНН|КПП|ОГРН|ОГРНИП|БИК|ОКПО|"
+    r"Р/с|К/с|Банк|Тел|Телефон|Факс|E-?mail|Адрес|Лицензиар|Лицензиат|"
+    r"СНИЛС|Сч[её]т)\b")
+
+
+def _fake_address(value: str) -> str:
+    """Подставной адрес той же формы, что и исходный фрагмент.
+
+    Реквизиты в PDF разложены на две колонки и две строки, поэтому адрес
+    приходит кусками: «105082, Москва г, ...» и «комната 7, этаж 6».
+    Каждый кусок получает свою часть подставного адреса — вместе они
+    складываются в правдоподобный адрес.
+    """
+    text = _clean_value(value)
+    if not re.search(r"\d", text):
+        return ""
+    digest = hashlib.sha256(("addr:" + text).encode("utf-8")).digest()
+    number = int.from_bytes(digest[:8], "big")
+    city = _ADDRESS_CITIES[number % len(_ADDRESS_CITIES)]
+    street = _ADDRESS_STREETS[(number // len(_ADDRESS_CITIES))
+                              % len(_ADDRESS_STREETS)]
+    index = 100000 + number % 90000
+    flat = number % 90 + 1
+    has_street = bool(_ADDRESS_STREET_RE.search(text))
+    has_region = bool(_ADDRESS_REGION_RE.search(text))
+    has_index = bool(re.search(r"(?<!\d)\d{5,6}(?!\d)", text))
+    if has_street:
+        result = f"{street}, д. {flat}"
+        if has_region or has_index:
+            result = f"{index}, {city}, {result}"
+        return result
+    if has_region:
+        return f"{index}, {city},"
+    if _ADDRESS_UNIT_RE.search(text):
+        return f"пом. {number % 40 + 1}, этаж {number % 9 + 1}"
+    return ""
+
+
+def _line_cells(line: str) -> List[Tuple[int, str]]:
+    """Кусочки строки, разделённые двумя и более пробелами (колонки PDF)."""
+    return [(m.start(), m.group())
+            for m in re.finditer(r"\S(?:.*?\S)?(?=\s{2,}|$)", line)]
+
+
+_BANK_LABEL_RE = re.compile(
+    r"(?i)^(?P<label>Банк(?:\s+(?:получателя|плательщика))?|"
+    r"Наименование\s+банка)\s*:\s*")
+_BANK_HINT_RE = re.compile(
+    r"(?i)\b(?:банк\w*|отделени\w*|филиал\w*|ПАО|АО|ООО|ОАО|ЗАО|НАО)\b")
+_BANK_NAMES = ("Северный Банк", "Банк Развития", "Городской Банк",
+               "Региональный Банк", "Торговый Банк", "Банк Прогресс",
+               "Универсальный Банк", "Банк Стандарт")
+
+
+def _fake_bank(value: str) -> str:
+    text = _clean_value(value)
+    if not _BANK_HINT_RE.search(text) or len(text) > 120:
+        return ""
+    digest = hashlib.sha256(("bank:" + text).encode("utf-8")).digest()
+    number = int.from_bytes(digest[:8], "big")
+    name = _BANK_NAMES[number % len(_BANK_NAMES)]
+    form = re.search(r"(?i)\b(ПАО|АО|ООО|ОАО|ЗАО|НАО)\b", text)
+    prefix = (form.group(1) + " ") if form else ""
+    return f"{prefix}«{name}»"
+
+
+def _bank_pairs(text: str) -> List[str]:
+    """Названия банков после подписи поля «Банк:».
+
+    В реквизитах банк стоит отдельной строкой и содержит город/отделение,
+    то есть тянет за собой настоящий регион. Подпись поля делает значение
+    однозначным, поэтому его можно закрыть детерминированно.
+    """
+    found: List[str] = []
+    for line in text.split("\n"):
+        for _, cell in _line_cells(line):
+            match = _BANK_LABEL_RE.match(cell)
+            if not match:
+                continue
+            value = cell[match.end():].strip()
+            value = re.split(r"\s+(?:БИК|К\s*/\s*с|Р\s*/\s*с)\b", value)[0].strip()
+            value = re.sub(r"\s+", " ", value)
+            if not value or not _BANK_HINT_RE.search(value) or len(value) > 120:
+                continue
+            if value not in found:
+                found.append(value)
+    return found
+
+
+def _address_pairs(text: str) -> List[str]:
+    """Адреса под явной подписью поля, включая перенос на следующую строку.
+
+    В реквизитах адрес часто разложен на две строки и на две колонки. Берём
+    только значение после подписи «Юр. Адрес:», поэтому обычный текст и
+    «Адрес электронной почты» не затрагиваются.
+    """
+    lines = text.split("\n")
+    found: List[str] = []
+    for index, line in enumerate(lines):
+        cells = _line_cells(line)
+        pending: List[Tuple[int, int, List[str]]] = []
+        for start, cell in cells:
+            match = _ADDRESS_LABEL_RE.match(cell)
+            if not match:
+                continue
+            value = cell[match.end():].strip()
+            if not value:
+                continue
+            pending.append((start, start + match.end(), [value]))
+        if not pending:
+            continue
+        # Продолжение адреса на следующей строке: та же колонка.
+        done: set[int] = set()
+        for row in range(index + 1, min(index + 3, len(lines))):
+            next_cells = _line_cells(lines[row])
+            if not next_cells:
+                break
+            for pos, item in enumerate(pending):
+                if pos in done:
+                    continue
+                value_col, parts = item[1], item[2]
+                best = min(next_cells, key=lambda c: abs(c[0] - value_col))
+                if abs(best[0] - value_col) > 30:
+                    done.add(pos)
+                    continue
+                candidate = best[1].strip()
+                if not candidate or _ADDRESS_FIELD_RE.match(candidate):
+                    done.add(pos)
+                    continue
+                last = parts[-1].rstrip()
+                if (not last.endswith((",", "с.", "д.", "-", "№"))
+                        and not _ADDRESS_HINT_RE.search(candidate)):
+                    done.add(pos)
+                    continue
+                parts.append(candidate)
+        for _, _, parts in pending:
+            # Каждый кусок адреса — отдельная пара: в PDF колонки и строки
+            # лежат в разных блоках, и сквозная строка там не находится.
+            for part in parts:
+                value = re.sub(r"\s+", " ", part).strip()
+                if value and value not in found:
+                    found.append(value)
+    return found
+
+
+_UUID_PATTERN = (r"(?<![0-9a-f])([0-9a-f]{8}\s*-\s*[0-9a-f]{4}\s*-\s*"
+                 r"[0-9a-f]{4}\s*-\s*[0-9a-f]{4}\s*-\s*[0-9a-f]{12})"
+                 r"(?![0-9a-f])")
+# UUID, разорванный колонкой таблицы: «e539630a-994e-411f-959b-» на одной
+# строке, хвост — на следующей. Полный шаблон такой разрыв не покроет.
+_PARTIAL_UUID_PATTERN = (
+    r"(?<![0-9a-f])"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-)"
+    r"(?=\s)")
+# Серийные номера квалифицированных сертификатов: длинная hex-строка,
+# которую в таблице подписи разрывают на две строки.
+_HEX_ID_PATTERN = (r"(?<![0-9A-Fa-f])(?=[0-9A-Fa-f]*[A-Fa-f])"
+                   r"(?=[0-9A-Fa-f]*\d)"
+                   r"([0-9A-Fa-f]{16,64}(?:\s+[0-9A-Fa-f]{4,16})?)"
+                   r"(?![0-9A-Fa-f])")
+
+_STRUCTURED_MASKS: Tuple[Tuple[str, str, Any], ...] = (
+    # (тип, регулярка, генератор замены)
+    ("ИНН", r"ИНН\s*[:№]?\s*(\d{12}|\d{10})(?!\d)", _fake_inn),
+    ("КПП", r"КПП\s*[:№]?\s*(\d{9})(?!\d)", _fake_kpp),
+    ("ОГРНИП", r"ОГРНИП\s*[:№]?\s*(\d{15})(?!\d)", _fake_ogrn),
+    ("ОГРН", r"ОГРН\s*[:№]?\s*(\d{13})(?!\d)", _fake_ogrn),
+    ("СНИЛС", r"(?<!\d)(\d{3}-\d{3}-\d{3}\s\d{2})(?!\d)", _fake_snils),
+    ("БИК", r"БИК\s*[:№]?\s*(\d{9})(?!\d)", _fake_bik),
+    ("ОКПО", r"ОКПО\s*[:№]?\s*(\d{10}|\d{8})(?!\d)", _fake_okpo),
+    ("р/с", r"(?:р\s*/\s*с|расч[её]тн\w*\s+сч[её]т)[^\d]{0,20}(\d{20})(?!\d)",
+     _fake_account),
+    ("к/с", r"(?:к\s*/\s*с|корр\.?\s*сч[её]т|корреспондентск\w*\s+сч[её]т)"
+            r"[^\d]{0,20}(\d{20})(?!\d)", _fake_account),
+    ("идентификатор", _UUID_PATTERN, _fake_uuid),
+    ("идентификатор", _PARTIAL_UUID_PATTERN, _fake_uuid),
+    ("идентификатор", _HEX_ID_PATTERN, _fake_hex_id),
+    ("email", r"(?<![\w.+-])([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})(?![\w.-])",
+     _fake_email),
+    ("телефон", r"(?<![\d+])((?:\+7|8)[\s-]?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2})(?!\d)",
+     _fake_phone),
+    ("сайт", r"(https?://[^\s<>\"')\]]+)", _fake_url),
+)
+
+_BARE_INN_RE = re.compile(r"(?<!\d)(\d{12}|\d{10})(?!\d)")
+_BARE_OGRN_RE = re.compile(r"(?<!\d)(\d{15}|\d{13})(?!\d)")
+_BARE_BIK_RE = re.compile(r"(?<!\d)(04\d{7})(?!\d)")
+
+
+def _structured_pairs(text: str, covered: set[str]) -> List[Dict[str, str]]:
+    """Страховка по форматам: ИНН, счета, email, телефоны и т.п.
+
+    Решение «что считать персональными данными» остаётся за моделью. Этот слой
+    только закрывает значения с жёстким форматом, которые модель пропустила:
+    уже согласованные пары не переопределяются. Замены детерминированы, поэтому
+    одно и то же значение во всех местах документа получает одну и ту же
+    подставную строку.
+    """
+    found: Dict[str, Tuple[str, str, str]] = {}
+
+    def add(value: str, kind: str, fake: Any) -> None:
+        value = str(value or "").strip()
+        if not value:
+            return
+        key = _mask_key(value)
+        if not key or key in covered or key in found:
+            return
+        # Модель уже вернула пару, внутри которой есть это значение, —
+        # не дробим её на части.
+        if any(key in item for item in covered if len(item) >= 5):
+            return
+        replacement = fake(value)
+        if not replacement or replacement == value:
+            return
+        found[key] = (value, kind, replacement)
+
+    for kind, pattern, fake in _STRUCTURED_MASKS:
+        for match in re.finditer(pattern, text, re.I):
+            add(match.group(1), kind, fake)
+
+    uuid_spans = [m.span(1) for m in re.finditer(_UUID_PATTERN, text, re.I)]
+
+    def in_uuid(span: Tuple[int, int]) -> bool:
+        return any(a <= span[0] and span[1] <= b for a, b in uuid_spans)
+
+    # Номера без подписи поля: только те, у которых сходится контрольная сумма.
+    for regex in (_BARE_INN_RE, _BARE_OGRN_RE):
+        for match in re.finditer(regex, text):
+            if in_uuid(match.span(1)):
+                continue
+            value = match.group(1)
+            if len(value) in (10, 12):
+                if _inn_valid(value):
+                    add(value, "ИНН", _fake_inn)
+            elif _ogrn_valid(value):
+                add(value, "ОГРН" if len(value) == 13 else "ОГРНИП", _fake_ogrn)
+    for match in re.finditer(_BARE_BIK_RE, text):
+        if not in_uuid(match.span(1)):
+            add(match.group(1), "БИК", _fake_bik)
+    for value in _address_pairs(text):
+        add(value, "адрес", _fake_address)
+    for value in _bank_pairs(text):
+        add(value, "банк", _fake_bank)
+
+    return [{"original": value, "replacement": fake, "type": kind,
+             "source": "формат"}
+            for value, kind, fake in found.values()]
+
+
+_FIELD_LABEL_RE = re.compile(
+    r"(?i)^((?:ИНН|КПП|ОГРНИП|ОГРН|БИК|ОКПО|СНИЛС|"
+    r"р\s*/\s*с|к\s*/\s*с|расч[её]тн\w*\s+сч[её]т|корр\.?\s*сч[её]т|"
+    r"банк(?:\s+(?:получателя|плательщика))?|наименование\s+банка|"
+    r"адрес\s+электронной\s+почты|электронная\s+почта|e-?mail|"
+    r"тел\.?|телефон|факс|сайт)\s*[:№]?\s*)")
+
+
+def _model_structured_replacement(original: str, replacement: str,
+                                  kind: str) -> str:
+    """Не даёт модели сломать формат реквизита.
+
+    Решение «это персональные данные» остаётся за моделью. Но её подставное
+    значение должно быть правдоподобным: ИНН с неверной контрольной суммой,
+    КПП из десяти цифр или email на чужом домене ломают документ и могут
+    случайно указать на реальную организацию. В таком случае подставляется
+    детерминированное значение той же формы. Подпись поля («ИНН: »,
+    «Банк: ») сохраняется — модель её иногда теряет.
+    """
+    value = _clean_value(original)
+    fake = _clean_value(replacement)
+    if not value or not fake:
+        return replacement
+    if "адрес" in str(kind or "").lower():
+        label = re.match(
+            r"(?i)^(?:(?:Юр(?:идический)?\.?\s*|Фактический\s+|Почтовый\s+)?"
+            r"адрес(?:\s+места\s+нахождения)?|Место\s+нахождения)"
+            r"\s*:\s*", value)
+        body = value[label.end():] if label else value
+        address = _fake_address(body)
+        if address:
+            return (label.group(0) if label else "") + address
+        return fake
+    label = ""
+    match = _FIELD_LABEL_RE.match(value)
+    if match:
+        label = match.group(0)
+        if fake.lower().startswith(label.lower()):
+            fake = fake[len(label):].strip()
+    body = value[len(label):].strip() if label else value
+    # Модель возвращает тип из закрытого списка («реквизит»), а вид значения
+    # надёжнее виден по подписи поля: «ИНН: », «БИК: », «Тел. ».
+    tag = (str(kind or "") + " " + label).lower()
+    if "банк" in tag:
+        return (label + _fake_bank(body)) if _fake_bank(body) else replacement
+    if re.fullmatch(r"\d{8}|\d{10}", body) and "окпо" in tag:
+        return label + _fake_okpo(body)
+    if re.fullmatch(r"\d{10}|\d{12}", body) and (
+            "инн" in tag or _inn_valid(body)):
+        return label + _fake_inn(body)
+    if re.fullmatch(r"\d{9}", body) and "кпп" in tag:
+        return label + _fake_kpp(body)
+    if re.fullmatch(r"\d{9}", body) and "бик" in tag:
+        return label + _fake_bik(body)
+    if re.fullmatch(r"\d{13}|\d{15}", body) and "огрн" in tag:
+        return label + _fake_ogrn(body)
+    if re.fullmatch(r"\d{20}", body):
+        return label + _fake_account(body)
+    if "снилс" in tag:
+        return label + _fake_snils(body)
+    if "email" in tag or "почт" in tag:
+        return label + _fake_email(body)
+    if "тел" in tag:
+        return label + _fake_phone(body)
+    if ("сайт" in tag or "url" in tag
+            or body.lower().startswith(("http://", "https://"))):
+        return label + _fake_url(body)
+    return fake if not label else label + fake
+
+
+def _trim_signature_line(value: str) -> str:
+    """Убирает линию подчёркивания по краям: «___Иванов И.И.» -> «Иванов И.И.».
+
+    Модель иногда включает в original подпись-линию («____Капишникова М.В.»).
+    Тогда пара получает собственный ключ, и то же ФИО в другом месте документа
+    закрывается другой производной парой. Имя без линии совпадает по ключу
+    с остальными формами, а подчёркивания в тексте остаются на месте.
+    """
+    text = str(value or "").strip()
+    if "_" not in text:
+        return value
+    trimmed = re.sub(r"^_{2,}[\s_]*", "", text)
+    trimmed = re.sub(r"[\s_]*_{2,}$", "", trimmed).strip()
+    return trimmed or value
 
 
 def _not_applied(masker: Masker, replacements: Any) -> List[Dict[str, str]]:
@@ -1718,10 +2522,12 @@ def _not_applied(masker: Masker, replacements: Any) -> List[Dict[str, str]]:
         if not isinstance(item, dict):
             continue
         original = str(item.get("original") or "")
+        kind = str(item.get("type") or "")
+        replacement = str(item.get("replacement") or "")
         keys = {_mask_key(original)}
-        for short, _ in _signature_pairs(original,
-                                         str(item.get("replacement") or ""),
-                                         str(item.get("type") or "")):
+        for short, _ in _signature_pairs(original, replacement, kind):
+            keys.add(_mask_key(short))
+        for short, _ in _org_pairs(original, replacement, kind):
             keys.add(_mask_key(short))
         keys.discard("")
         if not keys:
@@ -1749,34 +2555,141 @@ def _unused_warning(left: List[Dict[str, str]], total: int,
             f"их нет в тексте файла: {shown}")
 
 
+def _output_text(path: Path, ext: str) -> str:
+    try:
+        if ext == ".pdf":
+            return extract_pdf_text(path)[0]
+        if ext == ".docx":
+            return extract_docx_text(path)
+        if ext == ".xlsx":
+            return extract_excel_text(path)[0]
+    except Exception as e:
+        logger.warning(f"Проверка результата: {e}")
+    return ""
+
+
+def _residual_values(output_path: Path, ext: str,
+                     replacements: Any) -> List[Dict[str, str]]:
+    """Исходные значения, которые остались в уже сохранённом результате.
+
+    Это не повторная проверка моделью, а дешёвый детерминированный контроль:
+    если пара была согласована, но оригинал всё ещё есть в файле, документ
+    нельзя отдавать наружу.
+    """
+    text = _output_text(output_path, ext)
+    if not text.strip():
+        return []
+    items = [item for item in (replacements or []) if isinstance(item, dict)]
+    # Подставное значение может совпасть с исходным значением другой пары
+    # (модель заменила «10 календарных дней» на «15 календарных дней», а в
+    # договоре есть и исходные «15 календарных дней»). Такие совпадения — не
+    # утечка, поэтому перед проверкой убираем из текста все подставные строки.
+    scoped = text
+    fakes = {_clean_value(item.get("replacement")) for item in items}
+    for fake in sorted((f for f in fakes if len(f) >= 4), key=len, reverse=True):
+        pattern = _flex_pattern(fake)
+        if not pattern:
+            continue
+        try:
+            scoped = re.sub(pattern, " ", scoped, flags=re.I)
+        except re.error:
+            continue
+    left: List[Dict[str, str]] = []
+    for item in items:
+        original = _clean_value(item.get("original"))
+        replacement = _clean_value(item.get("replacement"))
+        if len(original) < 4 or not replacement or original == replacement:
+            continue
+        # Замена содержит оригинал как часть (например, «ООО «Ромашка»» ->
+        # «ООО «Ромашка-2»») — такая пара не может очистить текст полностью.
+        if original.lower() in replacement.lower():
+            continue
+        if _find_occurrences(scoped, original):
+            left.append(item)
+    return left
+
+
+def _residual_error(left: List[Dict[str, str]]) -> str:
+    shown = "; ".join(f"«{_clean_value(i.get('original'))[:70]}»" for i in left[:8])
+    if len(left) > 8:
+        shown += f" и ещё {len(left) - 8}"
+    return ("Обезличивание неполное: в результате остались исходные значения: "
+            f"{shown}. Файл не сохранён — проверьте документ и повторите обработку")
+
+
+def _fail_on_residual(output_path: Path, ext: str, replacements: Any,
+                      user: str, filename: str) -> None:
+    """Не выпускает файл, если в нём остались исходные значения."""
+    left = _residual_values(output_path, ext, replacements)
+    if not left:
+        return
+    _append_mask_log(user, filename,
+                     [{**item, "status": "осталось в файле"} for item in left],
+                     page="проверка результата")
+    logger.error(f"MASK | {filename}: в результате осталось {len(left)} исходных значений")
+    try:
+        output_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    raise RuntimeError(_residual_error(left))
+
+
+def _images_note(count: Any) -> str:
+    try:
+        count = int(count or 0)
+    except (TypeError, ValueError):
+        return ""
+    if count <= 0:
+        return ""
+    return (f"Из документа удалены изображения и штампы ({count}): печати, "
+            "подписи и логотипы больше не видны")
+
+
+def _replacement_order(replacements: Any) -> List[Dict[str, str]]:
+    """Полные ФИО раньше кратких: краткая форма должна получить ту же замену.
+
+    Модель может вернуть «Капишникова М.В.» отдельной парой, а полное ФИО —
+    в другом фрагменте. Если сначала записать краткую пару, производная от
+    полного ФИО («Петрова А.С.») уже не применится, и один человек получит
+    два разных имени.
+    """
+    items = [item for item in (replacements or []) if isinstance(item, dict)]
+    return sorted(items, key=lambda item: 0 if len(
+        _clean_value(item.get("original")).split()) >= 3 else 1)
+
+
 def _build_replacement_masker(replacements: Any) -> Masker:
     masker = Masker()
-    for item in replacements or []:
-        if isinstance(item, dict):
-            original = item.get("original") or ""
-            replacement = item.get("replacement") or ""
-            masker.set_exact(original, replacement)
-            for short, short_fake in _signature_pairs(
-                    original, replacement, str(item.get("type") or "")):
-                masker.set_exact(short, short_fake)
+    for item in _replacement_order(replacements):
+        original = item.get("original") or ""
+        replacement = item.get("replacement") or ""
+        masker.set_exact(original, replacement)
+        kind = str(item.get("type") or "")
+        for short, short_fake in _signature_pairs(original, replacement, kind):
+            masker.set_exact(short, short_fake)
+        for short, short_fake in _org_pairs(original, replacement, kind):
+            masker.set_exact(short, short_fake)
+        for brand, brand_fake in _brand_pairs(original, replacement, kind):
+            masker.set_exact(brand, brand_fake)
     return masker
 
 
 def _replacement_extras(replacements: Any) -> List[Dict[str, str]]:
     extras: List[Dict[str, str]] = []
-    for item in replacements or []:
-        if not isinstance(item, dict):
-            continue
+    for item in _replacement_order(replacements):
         original = item.get("original") or ""
         if not original:
             continue
         kind = str(item.get("type") or "")
         extras.append({"text": original, "type": kind})
-        for short, _ in _signature_pairs(original,
-                                         item.get("replacement") or "", kind):
+        replacement = item.get("replacement") or ""
+        for short, _ in _signature_pairs(original, replacement, kind):
             extras.append({"text": short, "type": kind})
+        for short, _ in _org_pairs(original, replacement, kind):
+            extras.append({"text": short, "type": kind})
+        for brand, _ in _brand_pairs(original, replacement, kind):
+            extras.append({"text": brand, "type": kind})
     return extras
-
 
 # ================================================================
 # 4. ОБРАБОТКА ФАЙЛОВ
@@ -2569,6 +3482,42 @@ def _scrub_pdf_annotations(page, extras: Any, masker: Masker) -> int:
     return masked
 
 
+def _strip_pdf_images(page) -> int:
+    """Удаляет растровые изображения и штампы страницы: печати и подписи.
+
+    Текст на картинке не распознаётся (OCR не используется), поэтому оставлять
+    изображение в результате нельзя: название организации на печати или скан
+    подписи деанонимизируют документ. Векторная графика (линии таблиц) остаётся.
+    Печати и подписи часто лежат не картинкой, а аннотацией-штампом (Stamp),
+    поэтому аннотации удаляются так же — иначе поверх чистого текста остаётся
+    настоящая печать с названием и ИНН.
+    """
+    import pymupdf
+    try:
+        count = len(page.get_images(full=True))
+    except Exception:
+        count = 0
+    removed = 0
+    try:
+        for annot in list(page.annots() or []):
+            try:
+                page.delete_annot(annot)
+                removed += 1
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"PDF annotations: {e}")
+    if count:
+        try:
+            page.add_redact_annot(page.rect, fill=None)
+            page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_REMOVE,
+                                  graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                                  text=pymupdf.PDF_REDACT_TEXT_NONE)
+        except Exception as e:
+            logger.warning(f"PDF images: {e}")
+    return count + removed
+
+
 def _scrub_pdf_metadata(doc, extras: Any, masker: Masker) -> int:
     """Убирает ПДн из свойств документа, XMP и закладок."""
     masked = 0
@@ -2629,6 +3578,7 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = (),
         doc.close()
         raise ValueError("PDF защищён паролем")
     total = 0
+    images_removed = 0
     pages = len(doc)
     masker = masker or Masker()
     for page_index, page in enumerate(doc):
@@ -2723,6 +3673,7 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = (),
                          draw_text, _span_color(span), path, rot))
         if not jobs:
             total += _scrub_pdf_annotations(page, extras, masker)
+            images_removed += _strip_pdf_images(page)
             if progress:
                 progress(page_index + 1, pages)
             continue
@@ -2748,12 +3699,13 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = (),
                 page.insert_text(origin, MASK, fontname="helv", fontsize=fs,
                                  color=color, rotate=rot)
         total += _scrub_pdf_annotations(page, extras, masker)
+        images_removed += _strip_pdf_images(page)
         if progress:
             progress(page_index + 1, pages)
     total += _scrub_pdf_metadata(doc, extras, masker)
     doc.save(output_path, garbage=3, deflate=True)
     doc.close()
-    return {"masked": total, "pages": pages}
+    return {"masked": total, "pages": pages, "images_removed": images_removed}
 
 def _excel_cell_text(v: Any) -> str | None:
     """Текст ячейки, включая rich text; None для чисел/дат/формул."""
@@ -3148,6 +4100,7 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = (),
         masked += _scrub_excel_properties(wb, masker, extras)
         wb.save(output_path)
         preview = _excel_preview(wb.active)
+        images_removed = _blank_office_images(output_path)
     finally:
         wb.close()
         if cached_wb is not None:
@@ -3155,7 +4108,8 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = (),
                 cached_wb.close()
             except Exception:
                 pass
-    stats: Dict[str, Any] = {"masked": masked, "pages": 1, "preview_rows": preview}
+    stats: Dict[str, Any] = {"masked": masked, "pages": 1, "preview_rows": preview,
+                             "images_removed": images_removed}
     if formula_replaced:
         logger.info(f"XLSX: {formula_replaced} формул заменены значениями — "
                     "результат вычислений содержал данные под замену")
@@ -3483,11 +4437,86 @@ def extract_docx_text(path: Path) -> str:
     return extract_docx_segments(path)[0]
 
 
+_MEDIA_EXTS = {"png", "jpg", "jpeg", "jpe", "gif", "bmp", "tif", "tiff",
+               "emf", "wmf", "svg", "webp"}
+_CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+
+def _blank_image_bytes() -> bytes:
+    """1x1 белый PNG, которым заменяется любая картинка в .docx/.xlsx."""
+    import io
+
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (1, 1), (255, 255, 255)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _is_media_entry(name: str) -> bool:
+    low = name.lower()
+    return (low.startswith("word/media/") or low.startswith("xl/media/")
+            or low.startswith("docprops/thumbnail"))
+
+
+def _patch_content_types(raw: bytes) -> bytes:
+    """Объявляет все картинки PNG: их содержимое заменено на 1x1 PNG."""
+    try:
+        ET.register_namespace("", _CONTENT_TYPES_NS)
+        root = ET.fromstring(raw)
+    except Exception:
+        return raw
+    changed = False
+    for el in root:
+        tag = el.tag.rsplit("}", 1)[-1]
+        if tag == "Default":
+            ext = str(el.get("Extension") or "").lower()
+            if ext in _MEDIA_EXTS and el.get("ContentType") != "image/png":
+                el.set("ContentType", "image/png")
+                changed = True
+        elif tag == "Override":
+            part = str(el.get("PartName") or "").lstrip("/")
+            if _is_media_entry(part):
+                el.set("ContentType", "image/png")
+                changed = True
+    if not changed:
+        return raw
+    return ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+
+
+def _blank_office_images(path: Path) -> int:
+    """Заменяет все картинки в готовом .docx/.xlsx на пустое изображение."""
+    blank = _blank_image_bytes()
+    tmp = path.with_name(f".{path.name}.imgtmp")
+    removed = 0
+    try:
+        with zipfile.ZipFile(path) as zin, \
+                zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                name = item.filename
+                if _is_media_entry(name):
+                    zout.writestr(item, blank)
+                    removed += 1
+                    continue
+                if name == "[Content_Types].xml":
+                    zout.writestr(item, _patch_content_types(zin.read(name)))
+                    continue
+                zout.writestr(item, zin.read(name))
+        if removed:
+            os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return removed
+
+
 def mask_docx_file(input_path: Path, output_path: Path, extras: Any = (),
                    masker: Masker | None = None, progress: Any = None) -> Dict[str, Any]:
     masker = masker or Masker()
     parts = _docx_parts(input_path)
     masked = 0
+    media_removed = 0
     changed_parts: Dict[str, bytes] = {}
     try:
         with zipfile.ZipFile(input_path) as zin:
@@ -3525,94 +4554,27 @@ def mask_docx_file(input_path: Path, output_path: Path, extras: Any = (),
                 if rel_masked:
                     changed_parts[name] = data
                     masked += rel_masked
+            blank = _blank_image_bytes()
             with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
-                    data = changed_parts.get(item.filename)
-                    zout.writestr(item, data if data is not None else zin.read(item.filename))
+                    name = item.filename
+                    if _is_media_entry(name):
+                        # Печати, подписи и логотипы: текст с них не читается,
+                        # поэтому картинка заменяется пустым изображением.
+                        zout.writestr(item, blank)
+                        media_removed += 1
+                        continue
+                    if name == "[Content_Types].xml":
+                        zout.writestr(item, _patch_content_types(zin.read(name)))
+                        continue
+                    data = changed_parts.get(name)
+                    zout.writestr(item, data if data is not None else zin.read(name))
     except Exception as e:
         logger.error(f"DOCX mask: {e}")
         raise
     preview = extract_docx_text(output_path)[:1800]
-    return {"masked": masked, "pages": 1, "preview": preview}
-
-
-def _convert_with_word(src: Path, dst: Path) -> bool:
-    script = (
-        "$ErrorActionPreference='Stop';"
-        "$app=New-Object -ComObject Word.Application;"
-        "$app.Visible=$false;$app.DisplayAlerts=0;"
-        f"$doc=$app.Documents.Open('{str(src).replace(chr(39), chr(39) * 2)}',$false,$true);"
-        "try{"
-        f"$doc.SaveAs([ref]'{str(dst).replace(chr(39), chr(39) * 2)}',[ref]16)"
-        "}finally{$doc.Close(0);$app.Quit()}"
-    )
-    try:
-        proc = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, timeout=180)
-        return proc.returncode == 0 and dst.exists() and dst.stat().st_size > 0
-    except Exception as e:
-        logger.warning(f"DOC Word convert: {e}")
-        return False
-
-
-def _convert_with_libreoffice(src: Path, dst: Path) -> bool:
-    candidates = ["soffice", "soffice.exe",
-                  r"C:\Program Files\LibreOffice\program\soffice.exe",
-                  r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"]
-    for exe in candidates:
-        try:
-            proc = subprocess.run(
-                [exe, "--headless", "--convert-to", "docx", "--outdir",
-                 str(dst.parent), str(src)],
-                capture_output=True, timeout=180)
-        except Exception:
-            continue
-        made = dst.parent / (src.stem + ".docx")
-        if proc.returncode == 0 and made.exists() and made.stat().st_size > 0:
-            if made != dst:
-                shutil.move(str(made), str(dst))
-            return True
-    return False
-
-
-def _doc_to_docx(src: Path, dst: Path) -> None:
-    """Старый .doc -> .docx. Сначала проверяем, что это не переименованный docx."""
-    try:
-        with open(src, "rb") as f:
-            head = f.read(8)
-    except Exception as e:
-        raise RuntimeError(f"Не удалось прочитать .doc: {e}")
-    if head[:2] == b"PK":
-        shutil.copyfile(src, dst)
-        return
-    if _convert_with_word(src, dst) or _convert_with_libreoffice(src, dst):
-        return
-    raise RuntimeError("Не удалось преобразовать .doc. Установите Microsoft Word "
-                       "или LibreOffice, либо сохраните файл как .docx")
-
-
-def process_doc(input_path: Path, output_path: Path,
-                progress: Any = None, user: str = "",
-                filename: str = "") -> Dict[str, Any]:
-    def report(pct: int, stage: str) -> None:
-        if progress:
-            progress(max(0, min(99, int(pct))), stage)
-
-    report(1, "Преобразование .doc")
-    tmp = input_path.with_name(f"{input_path.stem}.converted.docx")
-    try:
-        _doc_to_docx(input_path, tmp)
-        result = process_docx(tmp, output_path, progress=progress,
-                              user=user, filename=filename)
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
-    result["warning"] = ("Файл .doc преобразован в .docx"
-                         + (f". {result['warning']}" if result.get("warning") else ""))
-    return result
+    return {"masked": masked, "pages": 1, "preview": preview,
+            "images_removed": media_removed}
 
 
 def process_docx(input_path: Path, output_path: Path,
@@ -3646,250 +4608,13 @@ def process_docx(input_path: Path, output_path: Path,
         _append_mask_log(user, filename or input_path.name,
                          [{**item, "status": "не найдено в файле"} for item in left],
                          page="проверка файла")
+    _fail_on_residual(output_path, ".docx", replacements,
+                      user, filename or input_path.name)
     report(100, "Готово")
     result: Dict[str, Any] = {"preview_type": "docx", **stats, "llm_used": llm_ok}
-    if unused:
-        result["warning"] = unused
-    return result
-
-
-def _ocr_tesseract(path: Path) -> List[Dict[str, Any]]:
-    try:
-        import pytesseract
-        from PIL import Image
-        from pytesseract import Output
-    except Exception:
-        return []
-    s = load_settings()
-    try:
-        with Image.open(path) as img:
-            data = pytesseract.image_to_data(
-                img.convert("RGB"), lang=str(s.get("ocr_lang", "rus+eng")),
-                output_type=Output.DICT)
-    except Exception as e:
-        logger.warning(f"OCR tesseract: {e}")
-        return []
-    lines: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
-    for i, text in enumerate(data.get("text", [])):
-        text = (text or "").strip()
-        if not text:
-            continue
-        try:
-            x, y = int(data["left"][i]), int(data["top"][i])
-            w, h = int(data["width"][i]), int(data["height"][i])
-        except Exception:
-            continue
-        key = (int(data["block_num"][i]), int(data["par_num"][i]),
-               int(data["line_num"][i]))
-        item = lines.get(key)
-        if item is None:
-            lines[key] = {"text": text, "box": [x, y, x + w, y + h]}
-        else:
-            item["text"] += " " + text
-            b = item["box"]
-            b[0], b[1] = min(b[0], x), min(b[1], y)
-            b[2], b[3] = max(b[2], x + w), max(b[3], y + h)
-    return list(lines.values())
-
-
-IMAGE_OCR_PROMPT = (
-    "Распознай весь текст на изображении документа и верни координаты строк. "
-    "Ответ — строго JSON без markdown:\n"
-    '{"lines":[{"text":"точный текст строки","box":[x0,y0,x1,y1]}]}\n'
-    "box — прямоугольник строки в координатах 0..1000 относительно ширины и "
-    "высоты изображения. Сохраняй порядок строк сверху вниз, не пропускай "
-    "таблицы, реквизиты, подписи и мелкий текст."
-)
-
-
-def _ocr_vision(path: Path) -> List[Dict[str, Any]]:
-    """OCR через мультимодальную модель LM Studio (если Tesseract недоступен)."""
-    s = load_settings()
-    try:
-        from PIL import Image
-        with Image.open(path) as img:
-            width, height = img.size
-            img = img.convert("RGB")
-            img.thumbnail((2400, 2400))
-            tw, th = img.size
-            import io
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=90)
-    except Exception as e:
-        logger.warning(f"OCR image open: {e}")
-        return []
-    data_url = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-    payload = {
-        "model": s.get("model"),
-        "temperature": 0,
-        "max_tokens": max(4096, int(s.get("max_tokens", 4096) or 4096)),
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": IMAGE_OCR_PROMPT},
-                {"type": "image_url", "image_url": {"url": data_url}},
-            ],
-        }],
-    }
-    url = str(s.get("lm_studio_url") or "").rstrip("/") + "/chat/completions"
-    try:
-        req = urllib.request.Request(
-            url, data=json.dumps(payload).encode("utf-8"), method="POST",
-            headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {s.get('api_key', 'lm-studio')}"})
-        timeout = max(60, int(s.get("model_load_timeout", 600) or 600))
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = json.loads(r.read().decode("utf-8"))
-        content = raw["choices"][0]["message"]["content"]
-        parsed = _load_llm_json(content)
-    except Exception as e:
-        logger.warning(f"OCR vision: {e}")
-        return []
-    items = parsed.get("lines") if isinstance(parsed, dict) else parsed
-    if not isinstance(items, list):
-        logger.warning("OCR vision: нет JSON со строками")
-        return []
-    lines: List[Dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        text = str(item.get("text") or "").strip()
-        box = item.get("box") or item.get("bbox")
-        if not text or not isinstance(box, (list, tuple)) or len(box) != 4:
-            continue
-        try:
-            x0, y0, x1, y1 = [float(v) for v in box]
-        except (TypeError, ValueError):
-            continue
-        if max(x0, x1, y0, y1) <= 1.5:
-            x0, x1, y0, y1 = x0 * width, x1 * width, y0 * height, y1 * height
-        elif max(x0, x1, y0, y1) <= 1005:
-            # Модель просили вернуть координаты 0..1000.
-            x0, x1 = x0 / 1000 * width, x1 / 1000 * width
-            y0, y1 = y0 / 1000 * height, y1 / 1000 * height
-        else:
-            # Координаты в пикселях уменьшенной копии.
-            x0, x1 = x0 * width / max(1, tw), x1 * width / max(1, tw)
-            y0, y1 = y0 * height / max(1, th), y1 * height / max(1, th)
-        x0, x1 = sorted((max(0, x0), min(width, x1)))
-        y0, y1 = sorted((max(0, y0), min(height, y1)))
-        if x1 - x0 < 2 or y1 - y0 < 2:
-            continue
-        lines.append({"text": text, "box": [x0, y0, x1, y1]})
-    if lines:
-        logger.info(f"OCR vision: {len(lines)} строк")
-    return lines
-
-
-def extract_image_text(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
-    """OCR: сначала Tesseract, иначе мультимодальная модель LM Studio."""
-    lines = _ocr_tesseract(path)
-    if not lines:
-        lines = _ocr_vision(path)
-    return "\n".join(str(line.get("text") or "") for line in lines
-                     if str(line.get("text") or "").strip()), lines
-
-
-def _ocr_segments(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Карта строк OCR: каждая распознанная строка — отдельное место документа."""
-    segments: List[Dict[str, Any]] = []
-    position = 0
-    for index, line in enumerate(lines, start=1):
-        text = str(line.get("text") or "")
-        if not text.strip():
-            continue
-        segments.append({"start": position, "end": position + len(text),
-                         "label": f"строка {index}"})
-        position += len(text) + 1
-    return segments
-
-
-def mask_image_file(input_path: Path, output_path: Path, lines: List[Dict[str, Any]],
-                    extras: Any = (), masker: Masker | None = None,
-                    progress: Any = None) -> Dict[str, Any]:
-    from PIL import Image, ImageDraw, ImageFont
-    masker = masker or Masker()
-    masked = 0
-    preview: List[str] = []
-    font_path = _font_path(False, False)
-    with Image.open(input_path) as src:
-        img = src.convert("RGB")
-    draw = ImageDraw.Draw(img)
-    total = max(1, len(lines))
-    for index, line in enumerate(lines):
-        text = str(line.get("text") or "")
-        new = mask_text(text, extras, masker)
-        preview.append(new)
-        if new != text:
-            x0, y0, x1, y1 = [int(round(v)) for v in line["box"]]
-            x0, y0 = max(0, x0), max(0, y0)
-            x1 = min(img.width, max(x1, x0 + 1))
-            y1 = min(img.height, max(y1, y0 + 1))
-            draw.rectangle([x0, y0, x1, y1], fill=(255, 255, 255))
-            # Фейковый текст той же строки, чтобы документ остался читаемым.
-            size = max(8, int((y1 - y0) * 0.8))
-            font = None
-            if font_path:
-                try:
-                    font = ImageFont.truetype(font_path, size)
-                except Exception:
-                    font = None
-            if font is not None:
-                try:
-                    while size > 7 and draw.textlength(new, font=font) > (x1 - x0):
-                        size -= 1
-                        font = ImageFont.truetype(font_path, size)
-                    draw.text((x0, y0), new, fill=(0, 0, 0), font=font)
-                except Exception:
-                    pass
-            masked += 1
-        if progress:
-            progress(index + 1, total)
-    suffix = output_path.suffix.lower()
-    if suffix in (".jpg", ".jpeg"):
-        img.save(output_path, format="JPEG", quality=95)
-    else:
-        img.save(output_path, format="PNG")
-    return {"masked": masked, "pages": 1, "preview": "\n".join(preview)[:1800]}
-
-
-def process_image(input_path: Path, output_path: Path,
-                  progress: Any = None, user: str = "",
-                  filename: str = "") -> Dict[str, Any]:
-    def report(pct: int, stage: str) -> None:
-        if progress:
-            progress(max(0, min(99, int(pct))), stage)
-
-    report(1, "Распознавание текста")
-    report(2, "Загрузка модели")
-    _prepare_llm(report)
-    report(4, "Распознавание текста")
-    text, lines = extract_image_text(input_path)
-    if not lines or not text.strip():
-        raise RuntimeError("На изображении не найден текст. Установите Tesseract "
-                           "(rus+eng) или используйте мультимодальную модель LM Studio")
-    report(8, "Поиск персональных данных")
-    replacements, llm_ok, llm_error = anonymize_text(
-        text, _ocr_segments(lines), _progress_callback(progress, 8, 64, "Обезличивание текста"),
-        user=user, filename=filename or input_path.name)
-    if not llm_ok:
-        raise RuntimeError(_llm_failure_message(llm_error))
-    report(73, "Применение замен")
-    extras = _replacement_extras(replacements)
-    masker = _build_replacement_masker(replacements)
-    stats = mask_image_file(
-        input_path, output_path, lines, extras, masker=masker,
-        progress=_progress_callback(progress, 73, 24, "Перерисовка изображения"))
-    left = _not_applied(masker, replacements)
-    unused = _unused_warning(left, len(replacements), filename or input_path.name)
-    if unused:
-        _append_mask_log(user, filename or input_path.name,
-                         [{**item, "status": "не найдено в файле"} for item in left],
-                         page="проверка файла")
-    report(100, "Готово")
-    result: Dict[str, Any] = {"preview_type": "image", **stats, "llm_used": llm_ok}
-    if unused:
-        result["warning"] = unused
+    warning = "; ".join(part for part in (unused, _images_note(stats.get("images_removed"))) if part)
+    if warning:
+        result["warning"] = warning
     return result
 
 
@@ -3915,7 +4640,9 @@ def process_pdf(input_path: Path, output_path: Path,
     warning = None
     ratio = _pdf_text_ratio(input_path)
     if ratio < 0.5:
-        warning = "PDF похож на скан: часть страниц без текстового слоя. OCR не поддерживается — эти страницы не будут обезличены."
+        warning = ("PDF похож на скан: часть страниц без текстового слоя. "
+                   "Текст с картинок не распознаётся, изображения будут удалены — "
+                   "такие страницы останутся пустыми.")
         logger.warning(f"PDF scan-like: {input_path.name}, text_pages_ratio={ratio:.2f}")
     text, segments = extract_pdf_text(input_path)
     report(3, "Загрузка модели")
@@ -3939,6 +4666,11 @@ def process_pdf(input_path: Path, output_path: Path,
         _append_mask_log(user, filename or input_path.name,
                          [{**item, "status": "не найдено в файле"} for item in left],
                          page="проверка файла")
+    _fail_on_residual(output_path, ".pdf", replacements,
+                      user, filename or input_path.name)
+    note = _images_note(stats.get("images_removed"))
+    if note:
+        warning = f"{warning}; {note}" if warning else note
     report(98, "Сохранение")
     preview = ""
     try:
@@ -3988,11 +4720,15 @@ def process_excel(input_path: Path, output_path: Path,
         _append_mask_log(user, filename or input_path.name,
                          [{**item, "status": "не найдено в файле"} for item in left],
                          page="проверка файла")
+    _fail_on_residual(output_path, ".xlsx", replacements,
+                      user, filename or input_path.name)
     report(98, "Сохранение")
     stats_warning = str(stats.pop("warning", "") or "")
     result: Dict[str, Any] = {"preview_type": "excel", "preview": stats.pop("preview_rows", []),
                               "llm_used": llm_ok, **stats}
-    warning = "; ".join(part for part in (stats_warning, unused) if part)
+    warning = "; ".join(part for part in
+                        (stats_warning, unused, _images_note(stats.get("images_removed")))
+                        if part)
     if warning:
         result["warning"] = warning
     return result
