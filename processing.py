@@ -286,10 +286,12 @@ def _run_job(job_id: str, in_path: Path, out_path: Path, ext: str) -> None:
 # ================================================================
 # data/masking_log.json — человекочитаемый журнал:
 #   { "<логин>": { "<имя файла>": [ {"time", "page", "original",
-#                                    "replacement", "type"}, ... ] } }
+#                                    "replacement", "type", "status"}, ... ] } }
 # Пишется по мере обработки фрагментов, чтобы было видно, что именно
 # заменяется, даже если документ обработается не полностью. Одинаковые пары
 # повторно не добавляются, поэтому журнал можно безопасно дополнять.
+# status = "принято" — пара согласована моделью; "не найдено в файле" —
+# значение так и не применилось (это ошибка обезличивания, её видно сразу).
 MASK_LOG_LOCK = threading.Lock()
 
 
@@ -325,15 +327,17 @@ def _append_mask_log(user: str, filename: str, items: List[Dict[str, str]],
             if not isinstance(rows, list):
                 rows = []
                 files[filename] = rows
-            seen = {(str(row.get("original")), str(row.get("replacement")))
+            seen = {(str(row.get("original")), str(row.get("replacement")),
+                     str(row.get("status") or ""))
                     for row in rows if isinstance(row, dict)}
             added = 0
             for item in items:
                 original = str(item.get("original") or "")
                 replacement = str(item.get("replacement") or "")
+                status = str(item.get("status") or "принято")
                 if not original or not replacement:
                     continue
-                key = (original, replacement)
+                key = (original, replacement, status)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -344,6 +348,7 @@ def _append_mask_log(user: str, filename: str, items: List[Dict[str, str]],
                     "replacement": replacement,
                     "type": str(item.get("type") or ""),
                     "source": str(item.get("source") or "llm"),
+                    "status": status,
                 })
                 added += 1
             if added:
@@ -396,6 +401,24 @@ def _clean_value(v: Any) -> str:
             v = v[1:-1].strip()
             break
     return re.sub(r"\s+", " ", v).strip()
+
+
+_QUOTE_MARKS = "\u00ab\u00bb\u201e\u201c\u201d\u2018\u2019\"'`"
+
+
+def _mask_key(value: Any) -> str:
+    """Ключ, по которому значение ищется в заменах: без кавычек и регистра.
+
+    Модель может вернуть «Черноземье», а в документе стоять \"Черноземье\"
+    или Черноземье без кавычек. Шаблон поиска кавычки уже допускает, а ключ
+    замены раньше требовал их точного совпадения — и замена молча не
+    применялась. Для названий из нескольких слов это критично: кавычки стоят
+    внутри значения, поэтому _clean_value их не снимает.
+    """
+    text = _clean_value(value).lower().replace("ё", "е")
+    for ch in _QUOTE_MARKS:
+        text = text.replace(ch, "")
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _flex_pattern(value: str) -> str | None:
@@ -509,40 +532,59 @@ class Masker:
     """Хранит замены, полученные от модели, и отдаёт их с учётом регистра и кавычек.
 
     Ничего не придумывает: если модель не дала замену, текст остаётся как был.
+    hits считает, сколько раз замена реально применилась: по нему видно, какие
+    согласованные значения в файле так и не нашлись.
     """
 
     def __init__(self) -> None:
         self.exact: Dict[str, str] = {}
+        self.hits: Dict[str, int] = {}
 
     @staticmethod
     def _key(original: str) -> str:
-        return _clean_value(original).lower()
+        return _mask_key(original)
 
     def set_exact(self, original: str, fake: str) -> None:
         original = str(original or "").strip()
         fake = str(fake or "").strip()
-        if not original or not fake:
-            return
-        for key in (original.lower(), self._key(original),
-                    original.strip(" «»\"'“”").lower()):
-            if key:
-                self.exact.setdefault(key, fake)
+        key = self._key(original)
+        if key and fake:
+            self.exact.setdefault(key, fake)
+
+    def _find(self, original: str) -> str:
+        key = self._key(original)
+        return self.exact.get(key, "") if key else ""
+
+    def _count(self, original: str) -> None:
+        key = self._key(original)
+        if key:
+            self.hits[key] = self.hits.get(key, 0) + 1
 
     def lookup(self, original: str) -> str:
-        original = str(original or "")
-        for key in (original.strip().lower(), self._key(original),
-                    original.strip(" «»\"'“”").lower()):
-            fake = self.exact.get(key)
-            if fake:
-                return fake
-        return ""
+        """Замена для значения; попадание засчитывается как применённое."""
+        fake = self._find(original)
+        if fake:
+            self._count(original)
+        return fake
+
+    def peek(self, original: str) -> str:
+        """Замена без зачёта попадания — для предварительного поиска."""
+        return self._find(original)
+
+    def mark(self, original: str) -> None:
+        """Зачитывает замену, когда она действительно записана в файл."""
+        self._count(original)
 
     def get(self, kind: str, original: str) -> str:
-        fake = self.lookup(original)
+        original = str(original or "")
+        fake = self._find(original)
         if not fake:
-            return str(original or "")
+            return original
         if re.search(r"[А-Яа-яЁёA-Za-z]", original):
-            return _match_quotes(_apply_case(fake, original), original)
+            fake = _match_quotes(_apply_case(fake, original), original)
+        if fake == original:
+            return original
+        self._count(original)
         return fake
 
 
@@ -703,6 +745,7 @@ _JSON_RESPONSE_FORMAT: Dict[str, Any] = {
 _JSON_MODE_OFF: set[Tuple[str, str]] = set()
 _JSON_MODE_LOCK = threading.Lock()
 _WARMED_MODELS: set[Tuple[str, str]] = set()
+_WARM_ERRORS: Dict[Tuple[str, str], str] = {}
 _WARM_LOCK = threading.Lock()
 
 
@@ -731,8 +774,20 @@ def _model_is_warm(settings: Dict[str, Any]) -> bool:
 
 
 def _mark_model_warm(settings: Dict[str, Any]) -> None:
+    key = _llm_key(settings)
     with _WARM_LOCK:
-        _WARMED_MODELS.add(_llm_key(settings))
+        _WARMED_MODELS.add(key)
+        _WARM_ERRORS.pop(key, None)
+
+
+def _set_warm_error(settings: Dict[str, Any], text: str) -> None:
+    with _WARM_LOCK:
+        _WARM_ERRORS[_llm_key(settings)] = str(text or "")[:500]
+
+
+def _warm_error(settings: Dict[str, Any]) -> str:
+    with _WARM_LOCK:
+        return _WARM_ERRORS.get(_llm_key(settings), "")
 
 
 def _forget_model_warm(key: Tuple[str, str]) -> None:
@@ -796,10 +851,25 @@ def check_llm(settings: Dict[str, Any] | None = None) -> bool:
         logger.warning(f"LLM недоступна: {s.get('lm_studio_url')}")
         return False
     wanted = str(s.get("model") or "").lower()
-    if wanted and not any(str(i.get("id") or "").lower() == wanted for i in items):
-        logger.error(f"LLM: модель {s.get('model')} не найдена в LM Studio")
-        return False
-    return True
+    if not wanted:
+        return True
+    for item in items:
+        if str(item.get("id") or "").lower() != wanted:
+            continue
+        mtype = str(item.get("type") or "").lower()
+        if "embed" in mtype:
+            logger.error(f"LLM: {s.get('model')} — модель эмбеддингов, "
+                         "для обезличивания нужна чат-модель")
+            return False
+        return True
+    logger.error(f"LLM: модель {s.get('model')} не найдена в LM Studio")
+    return False
+
+
+def available_models(settings: Dict[str, Any] | None = None) -> List[str]:
+    """ID моделей, которые LM Studio показывает в своём списке."""
+    s = settings or load_settings()
+    return [str(item.get("id")) for item in _lm_models(s) if item.get("id")]
 
 
 def _try_lm_load(settings: Dict[str, Any]) -> None:
@@ -837,8 +907,13 @@ def warm_up_llm(settings: Dict[str, Any] | None = None, report: Any = None) -> b
     if state != "loaded":
         _try_lm_load(s)
     timeout = max(30, int(s.get("model_load_timeout", 600) or 600))
-    llm = get_llm({**s, "request_timeout": timeout})
+    # Для пробы хватает короткого ответа: не упираемся в max_tokens и лимиты
+    # конкретной модели, если в settings.json стоит слишком большое значение.
+    probe_tokens = min(64, max(8, int(s.get("max_tokens", 4096) or 4096)))
+    llm = get_llm({**s, "request_timeout": timeout, "max_tokens": probe_tokens})
     if llm is None:
+        _set_warm_error(s, "не удалось создать клиент ChatOpenAI "
+                           "(проверьте пакет langchain-openai)")
         return False
     deadline = time.time() + timeout
     attempt = 0
@@ -859,33 +934,47 @@ def warm_up_llm(settings: Dict[str, Any] | None = None, report: Any = None) -> b
             last = _llm_error_text(e)
             logger.warning(f"LLM загрузка, попытка {attempt}: {last[:300]}")
             status = _http_status_code(e)
-            retryable = (_is_model_loading_error(last)
+            # Переполнение контекста и «слишком большой» запрос — не загрузка:
+            # повтор не поможет, причину показываем сразу.
+            context_error = any(k in last.lower() for k in ("context", "too large"))
+            retryable = ((_is_model_loading_error(last) and not context_error)
                          or status in (408, 429)
                          or 500 <= status < 600)
             if not retryable:
                 # 400/401/403/404/422 и т.п. повтором не лечатся: не ждём
                 # model_load_timeout впустую.
+                _set_warm_error(s, last)
                 logger.error(f"LLM не готова: {last[:300]}")
                 return False
             if load_retry:
                 load_retry = False
                 _try_lm_load(s)
             if time.time() >= deadline:
+                _set_warm_error(s, f"не загрузилась за {timeout} с: {last}")
                 logger.error(f"LLM не загрузилась за {timeout} с: {last[:300]}")
                 return False
             time.sleep(min(15, 2 * attempt))
 
 
 def _is_model_loading_error(message: str) -> bool:
-    m = str(message or "").lower()
-    return any(k in m for k in ("loading", "not loaded", "no model", "model is not",
-                                "timed out", "timeout", "503", "connection", "refused",
-                                "context length", "context window", "too large"))
+    m = str(message or "").lower().replace("_", " ")
+    return any(k in m for k in ("loading", "not loaded", "unloaded", "no model",
+                                "no models", "model is not", "not ready",
+                                "failed to load", "not running", "timed out",
+                                "timeout", "503", "connection", "refused",
+                                "unreachable", "context length", "context window",
+                                "too large"))
 
 
 def _prepare_llm(report: Any = None) -> None:
-    if not warm_up_llm(report=report):
-        raise RuntimeError("Модель в LM Studio не загрузилась — обработка отменена")
+    s = load_settings()
+    if not warm_up_llm(s, report=report):
+        detail = _warm_error(s)
+        where = f"{s.get('lm_studio_url')} / {s.get('model')}"
+        message = f"Модель в LM Studio не загрузилась ({where}) — обработка отменена"
+        if detail:
+            message += f": {detail[:300]}"
+        raise RuntimeError(message)
 
 
 ANON_SYSTEM = (
@@ -1213,6 +1302,7 @@ def _parse_replacements(raw: str, chunk: str) -> Tuple[List[Dict[str, str]], Lis
 
     accepted: List[Dict[str, str]] = []
     invalid: List[Dict[str, str]] = []
+    missing: List[str] = []
     seen: set[str] = set()
     not_found = bad = 0
     for item in items:
@@ -1225,6 +1315,8 @@ def _parse_replacements(raw: str, chunk: str) -> Tuple[List[Dict[str, str]], Lis
         located = _locate_value(chunk, original, replacement)
         if not located:
             not_found += 1
+            if original:
+                missing.append(original)
             continue
         if _is_bad_value(located):
             bad += 1
@@ -1239,8 +1331,13 @@ def _parse_replacements(raw: str, chunk: str) -> Tuple[List[Dict[str, str]], Lis
             continue
         accepted.append({"original": located, "replacement": replacement, "type": kind})
     if not_found or bad:
-        logger.info(f"LLM разбор: принято {len(accepted)}, нет в тексте {not_found}, "
-                    f"непригодно {bad}, без замены {len(invalid)}")
+        sample = "; ".join(f"«{_clean_value(v)[:60]}»" for v in missing[:5])
+        if len(missing) > 5:
+            sample += f" и ещё {len(missing) - 5}"
+        logger.warning(f"LLM разбор: принято {len(accepted)}, нет в тексте {not_found}, "
+                       f"непригодно {bad}, без замены {len(invalid)}"
+                       + (f" | модель вернула, но в тексте не найдено: {sample}"
+                          if sample else ""))
     return accepted, invalid
 
 
@@ -1513,6 +1610,12 @@ def anonymize_text(text: str,
                     f"новых замен {added} | пропущено дублей {len(got) - added}")
     if progress:
         progress(total, total)
+    if not replacements:
+        # Пустой ответ модели — не успех: файл ушёл бы наружу без единой
+        # замены, а пользователь увидел бы «Готово». Отказ безопаснее.
+        logger.error(f"LLM | {filename or 'документ'}: модель не нашла ни одной "
+                     f"замены ({len(text)} символов, {total} фрагментов)")
+        return [], False, "no_replacements"
     logger.info(f"LLM | готово: {len(replacements)} замен, обработано {processed} символов")
     return replacements, True, ""
 
@@ -1524,6 +1627,9 @@ def _llm_failure_message(error: str) -> str:
         "empty": "В документе не найден текст для обезличивания",
         "invalid_json": "LLM вернула некорректный ответ — обработка отменена",
         "bad_replacement": "LLM не предложила замену для части данных — обработка отменена",
+        "no_replacements": "Модель не нашла ни одного значения для замены — "
+                           "обезличивание не выполнено, файл не выдан. "
+                           "Проверьте документ и повторите обработку",
     }
     if error in messages:
         return messages[error]
@@ -1598,6 +1704,51 @@ def _signature_pairs(original: str, replacement: str,
     return result
 
 
+def _not_applied(masker: Masker, replacements: Any) -> List[Dict[str, str]]:
+    """Согласованные замены, которые в файле так и не применились.
+
+    Если модель нашла значение, а в документе оно не заменилось, это ошибка
+    обезличивания. Раньше она проходила молча: журнал показывал пару как
+    принятую, а в файле оставался оригинал. Теперь такие значения видно
+    и в логе, и в интерфейсе.
+    """
+    left: List[Dict[str, str]] = []
+    hit_keys = [key for key, count in masker.hits.items() if count]
+    for item in replacements or []:
+        if not isinstance(item, dict):
+            continue
+        original = str(item.get("original") or "")
+        keys = {_mask_key(original)}
+        for short, _ in _signature_pairs(original,
+                                         str(item.get("replacement") or ""),
+                                         str(item.get("type") or "")):
+            keys.add(_mask_key(short))
+        keys.discard("")
+        if not keys:
+            continue
+        if any(masker.hits.get(k) for k in keys):
+            continue
+        # Короткий вариант мог уйти в составе длинного: «Черноземье» внутри
+        # «Общество с ограниченной ответственностью «Черноземье»».
+        if any(len(k) >= 3 and k in hit for k in keys for hit in hit_keys):
+            continue
+        left.append(item)
+    return left
+
+
+def _unused_warning(left: List[Dict[str, str]], total: int,
+                    filename: str) -> str:
+    """Текст предупреждения о значениях, которых не оказалось в файле."""
+    if not left:
+        return ""
+    shown = "; ".join(f"«{_clean_value(i.get('original'))[:70]}»" for i in left[:8])
+    if len(left) > 8:
+        shown += f" и ещё {len(left) - 8}"
+    logger.warning(f"MASK | {filename}: не применено {len(left)} из {total}: {shown}")
+    return (f"Не удалось заменить {len(left)} из {total} значений — "
+            f"их нет в тексте файла: {shown}")
+
+
 def _build_replacement_masker(replacements: Any) -> Masker:
     masker = Masker()
     for item in replacements or []:
@@ -1657,6 +1808,14 @@ def extract_pdf_text(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
                         value = str(info.get(key) or "").strip()
                         if value:
                             extra.append(value)
+            except Exception:
+                pass
+            try:
+                # Адреса ссылок не видны в тексте страницы, но остаются в PDF.
+                for link in page.get_links() or []:
+                    uri = link.get("uri")
+                    if isinstance(uri, str) and uri.strip():
+                        extra.append(uri.strip())
             except Exception:
                 pass
             if extra:
@@ -2162,6 +2321,142 @@ def _mask_page_rows(page_spans: List[Dict[str, Any]],
     return count
 
 
+def _mask_page_flow(page_spans: List[Dict[str, Any]], extras: Any,
+                    masker: Masker) -> int:
+    """Страховка для значений, разорванных между блоками по вертикали.
+
+    _mask_block видит только один блок, _mask_page_rows — только одну строку.
+    Если название организации перенесено на следующую строку и попало в
+    отдельный блок (частая выгрузка из PDF и правовых систем), совпадения
+    не находилось вовсе. Здесь строки страницы склеиваются сверху вниз, а
+    замена возвращается в те span, где стоял оригинал.
+    """
+    import pymupdf
+    items: List[Tuple[Dict[str, Any], Any]] = []
+    for span in page_spans:
+        if (span.get("_drop") or span.get("_new_text")
+                or span.get("_merge_spans")):
+            continue
+        try:
+            rect = pymupdf.Rect(span["bbox"])
+        except Exception:
+            continue
+        if rect.is_empty or rect.height <= 0:
+            continue
+        items.append((span, rect))
+    if len(items) < 2:
+        return 0
+
+    lines: List[Dict[str, Any]] = []
+    for span, rect in sorted(items, key=lambda x: (x[1].y0, x[1].x0)):
+        for line in lines:
+            lr = line["rect"]
+            overlap = min(lr.y1, rect.y1) - max(lr.y0, rect.y0)
+            if overlap > 0.5 * min(lr.height, rect.height):
+                line["items"].append((span, rect))
+                line["rect"] = pymupdf.Rect(
+                    min(lr.x0, rect.x0), min(lr.y0, rect.y0),
+                    max(lr.x1, rect.x1), max(lr.y1, rect.y1))
+                break
+        else:
+            lines.append({"items": [(span, rect)], "rect": pymupdf.Rect(rect)})
+    lines.sort(key=lambda line: (line["rect"].y0, line["rect"].x0))
+
+    # Колонки: строка с реквизитами справа не должна разрывать название,
+    # перенесённое на следующую строку. Span прикрепляется к колонке, с
+    # которой у него больше всего общего по горизонтали.
+    columns: List[Dict[str, Any]] = []
+    for li, line in enumerate(lines):
+        for span, rect in sorted(line["items"], key=lambda x: x[1].x0):
+            best = None
+            best_overlap = 0.0
+            for col in columns:
+                overlap = min(col["x1"], rect.x1) - max(col["x0"], rect.x0)
+                if overlap > best_overlap:
+                    best, best_overlap = col, overlap
+            if best is not None and best_overlap >= 0.5 * max(
+                    1.0, min(best["x1"] - best["x0"], rect.width)):
+                col = best
+            else:
+                col = {"items": [], "x0": rect.x0, "x1": rect.x1}
+                columns.append(col)
+            col["items"].append((span, li))
+            col["x0"] = min(col["x0"], rect.x0)
+            col["x1"] = max(col["x1"], rect.x1)
+
+    count = 0
+    for col in columns:
+        count += _mask_column_flow(col["items"], extras, masker)
+    return count
+
+
+def _mask_column_flow(items: List[Tuple[Dict[str, Any], int]], extras: Any,
+                      masker: Masker) -> int:
+    """Склеивает колонку сверху вниз и применяет найденные замены."""
+    chars: List[str] = []
+    cmap: List[Any] = []
+    flat: List[Dict[str, Any]] = []
+    last = ""
+    prev_line = None
+    for span, line_index in items:
+        text = span.get("text", "")
+        if not text:
+            continue
+        if prev_line is not None and line_index != prev_line:
+            chars.append("\n")
+            cmap.append(None)
+            last = "\n"
+        prev_line = line_index
+        si = len(flat)
+        flat.append(span)
+        if (chars and last and not last.isspace() and not text[0].isspace()
+                and last.isalnum() and text[0].isalnum()):
+            chars.append(" ")
+            cmap.append(None)
+        for oi, ch in enumerate(text):
+            if ch in _ZERO_WIDTH:
+                continue
+            nc = _norm_char(ch)
+            chars.append(nc)
+            cmap.append((si, oi))
+            last = nc
+    joined = "".join(chars)
+    if not joined.strip():
+        return 0
+    matches = iter_matches(joined, extras)
+    if not matches:
+        return 0
+
+    edits: Dict[int, List[Tuple[int, int, str]]] = {}
+    count = 0
+    for start, end, kind, value in matches:
+        pieces = _range_pieces(cmap, start, end)
+        # Значение внутри одного span блок уже обработал.
+        if len(pieces) < 2:
+            continue
+        fake = masker.get(kind, value)
+        if fake == value:
+            continue
+        originals = [flat[si]["text"][a:b] for si, a, b in pieces]
+        fakes = _distribute_replacement(fake, originals)
+        changed = False
+        for (si, a, b), old, fp in zip(pieces, originals, fakes):
+            if fp is None or fp == old:
+                continue
+            edits.setdefault(si, []).append((a, b, fp))
+            changed = True
+        if changed:
+            count += 1
+    for si, changes in edits.items():
+        span = flat[si]
+        text = span["text"]
+        for a, b, fp in sorted(changes, key=lambda x: -x[0]):
+            text = text[:a] + fp + text[b:]
+        if text != span["text"]:
+            span["_new_text"] = text
+    return count
+
+
 def _mask_block(block: Dict[str, Any], extras: Any, masker: Masker) -> int:
     """Меняет текст внутри блока, даже если сущность разбита на несколько span."""
     text, cmap, spans = _block_text(block)
@@ -2356,6 +2651,7 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = (),
         total += _mask_page_rows(page_spans, span_block, extras, masker)
         for block in blocks:
             total += _mask_block(block, extras, masker)
+        total += _mask_page_flow(page_spans, extras, masker)
         jobs: List[Tuple[List[Any], Tuple[float, float], float, str,
                          Tuple[float, float, float], str | None, int]] = []
         consumed: set[int] = set()
@@ -2511,22 +2807,28 @@ def _to_number(text: str, as_int: bool):
 
 
 def _numeric_fake(masker: Masker, value: Any):
-    """Замена для числовой или датовой ячейки — только если её дала модель."""
+    """Замена для числовой или датовой ячейки — только если её дала модель.
+
+    Попадание засчитывается лишь после успешного преобразования замены:
+    иначе значение, которое не удалось записать (не распарсилось число или
+    дата), выглядело бы обезличенным и не попадало в список «не применено».
+    """
     if isinstance(value, bool):
         return None
 
-    def lookup(*candidates: str) -> str:
+    def find(*candidates: str) -> Tuple[str, str]:
         for candidate in candidates:
-            fake = masker.lookup(candidate)
+            fake = masker.peek(candidate)
             if fake:
-                return fake
-        return ""
+                return candidate, fake
+        return "", ""
 
     if isinstance(value, (datetime_cls, date_cls)):
         is_datetime = isinstance(value, datetime_cls)
-        fake = lookup(value.isoformat(sep=" ") if is_datetime else value.isoformat(),
-                      value.strftime("%d.%m.%Y %H:%M:%S" if is_datetime else "%d.%m.%Y"),
-                      value.strftime("%d.%m.%Y"), value.strftime("%d/%m/%Y"))
+        candidate, fake = find(
+            value.isoformat(sep=" ") if is_datetime else value.isoformat(),
+            value.strftime("%d.%m.%Y %H:%M:%S" if is_datetime else "%d.%m.%Y"),
+            value.strftime("%d.%m.%Y"), value.strftime("%d/%m/%Y"))
         if not fake:
             return None
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d",
@@ -2535,20 +2837,24 @@ def _numeric_fake(masker: Masker, value: Any):
                 parsed = datetime_cls.strptime(fake, fmt)
             except Exception:
                 continue
+            masker.mark(candidate)
             return parsed if is_datetime else parsed.date()
         return None
 
     if isinstance(value, (int, float)):
         text = str(value)
         decimal = str(value).replace(".", ",")
-        fake = lookup(text, decimal, f"{value:,}".replace(",", " "),
-                      f"{value:,}".replace(",", "\u00a0"))
+        candidate, fake = find(text, decimal,
+                               f"{value:,}".replace(",", " "),
+                               f"{value:,}".replace(",", "\u00a0"))
         if not fake:
             return None
         try:
-            return _to_number(fake, isinstance(value, int))
+            number = _to_number(fake, isinstance(value, int))
         except Exception:
             return None
+        masker.mark(candidate)
+        return number
     return None
 
 
@@ -2649,6 +2955,29 @@ def _scrub_excel_properties(wb, masker: Masker, extras: Any) -> int:
     return masked
 
 
+def _cached_cell_value(cached_ws, cell) -> Any:
+    """Вычисленное значение той же ячейки из книги с data_only=True."""
+    if cached_ws is None:
+        return None
+    try:
+        return cached_ws.cell(row=cell.row, column=cell.column).value
+    except Exception:
+        return None
+
+
+def _cached_fake(masker: Masker, value: Any):
+    """Замена для результата формулы — только если её дала модель."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        fake = masker.peek(value)
+        if not fake:
+            return None
+        masker.mark(value)
+        return fake
+    return _numeric_fake(masker, value)
+
+
 def mask_excel_file(input_path: Path, output_path: Path, extras: Any = (),
                     masker: Masker | None = None,
                     progress: Any = None) -> Dict[str, Any]:
@@ -2656,6 +2985,35 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = (),
     wb = openpyxl.load_workbook(input_path)
     masker = masker or Masker()
     masked = 0
+    # Результат формулы не виден в тексте формулы, но именно он попадает
+    # в документ. Книга с data_only=True читается только если в файле есть
+    # формулы, и даёт вычисленные значения для поиска замены.
+    cached_wb: Any = None
+    cached_tried = False
+    cached_sheets: Dict[str, Any] = {}
+    formula_replaced = 0
+    formula_unchecked = 0
+
+    def cached_sheet(title: str):
+        nonlocal cached_wb, cached_tried
+        if title in cached_sheets:
+            return cached_sheets[title]
+        if not cached_tried:
+            cached_tried = True
+            try:
+                cached_wb = openpyxl.load_workbook(input_path, data_only=True)
+            except Exception as e:
+                logger.warning(f"XLSX cached values: {e}")
+                cached_wb = None
+        sheet = None
+        if cached_wb is not None and title in cached_wb.sheetnames:
+            try:
+                sheet = cached_wb[title]
+            except Exception:
+                sheet = None
+        cached_sheets[title] = sheet
+        return sheet
+
     try:
         sheets = list(wb.worksheets)
         for sheet_index, ws in enumerate(sheets):
@@ -2699,6 +3057,18 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = (),
                             if new_formula != text:
                                 cell.value = new_formula
                                 masked += 1
+                            # Если модель дала замену для вычисленного значения —
+                            # ставим её вместо формулы: иначе результат с ПДн
+                            # остался бы в книге и в кэше файла.
+                            cached = _cached_cell_value(cached_sheet(ws.title), cell)
+                            if cached is None:
+                                formula_unchecked += 1
+                            else:
+                                fake_value = _cached_fake(masker, cached)
+                                if fake_value is not None:
+                                    cell.value = fake_value
+                                    masked += 1
+                                    formula_replaced += 1
                             entries.append(None)
                         elif text:
                             entries.append((cell, text))
@@ -2780,7 +3150,21 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = (),
         preview = _excel_preview(wb.active)
     finally:
         wb.close()
-    return {"masked": masked, "pages": 1, "preview_rows": preview}
+        if cached_wb is not None:
+            try:
+                cached_wb.close()
+            except Exception:
+                pass
+    stats: Dict[str, Any] = {"masked": masked, "pages": 1, "preview_rows": preview}
+    if formula_replaced:
+        logger.info(f"XLSX: {formula_replaced} формул заменены значениями — "
+                    "результат вычислений содержал данные под замену")
+    if formula_unchecked:
+        # Книга не пересчитывалась (нет кэша): что именно считает формула,
+        # неизвестно, поэтому честно предупреждаем, а не выдаём за проверенное.
+        stats["warning"] = (f"{formula_unchecked} ячеек с формулами без вычисленного "
+                            "значения — их результат не проверен")
+    return stats
 
 DOCX_PARTS = ("word/document.xml", "word/header", "word/footer",
               "word/footnotes.xml", "word/endnotes.xml", "word/comments.xml",
@@ -2801,8 +3185,142 @@ def _register_docx_namespaces(raw: bytes) -> None:
             pass
 
 
+def _docx_root_namespaces(raw: bytes) -> Dict[str, str]:
+    """Объявления xmlns:prefix из корневого тега исходной части документа."""
+    try:
+        head = raw[:16000].decode("utf-8", "ignore")
+        match = re.search(r"<[A-Za-z_][^>]*>", head)
+        if not match:
+            return {}
+        return dict(re.findall(r'xmlns:([A-Za-z0-9_.-]+)="([^"]+)"', match.group(0)))
+    except Exception:
+        return {}
+
+
+def _docx_keep_namespaces(raw: bytes, data: bytes) -> bytes:
+    """Возвращает в корневой тег объявления namespace, потерянные ElementTree.
+
+    ET сериализует только префиксы, встречающиеся в именах элементов и
+    атрибутов. В word/document.xml от Word префиксы w14/wp14/w15 объявлены
+    только ради `mc:Ignorable`, поэтому после разбора и обратной сборки они
+    исчезают, а `mc:Ignorable="w14 wp14"` остаётся — Word считает файл
+    повреждённым. Здесь недостающие объявления дописываются обратно.
+    """
+    try:
+        declared = _docx_root_namespaces(raw)
+        if not declared:
+            return data
+        text = data.decode("utf-8")
+        match = re.search(r"<[A-Za-z_][^>]*>", text)
+        if not match:
+            return data
+        tag = match.group(0)
+        present = set(re.findall(r'xmlns:([A-Za-z0-9_.-]+)=', tag))
+        missing = [(prefix, uri) for prefix, uri in declared.items()
+                   if prefix not in present]
+        if not missing:
+            return data
+        extra = "".join(f' xmlns:{prefix}="{uri}"' for prefix, uri in missing)
+        if tag.endswith("/>"):
+            new_tag = tag[:-2] + extra + "/>"
+        else:
+            new_tag = tag[:-1] + extra + ">"
+        return text.replace(tag, new_tag, 1).encode("utf-8")
+    except Exception as e:
+        logger.warning(f"DOCX namespaces: {e}")
+        return data
+
+
+def _docx_rel_targets(raw: bytes) -> List[str]:
+    """Внешние адреса из *.rels (mailto:/URL)."""
+    try:
+        root = ET.fromstring(raw)
+    except Exception:
+        return []
+    out: List[str] = []
+    for el in root.iter():
+        if not str(el.tag).endswith("Relationship"):
+            continue
+        if (el.get("TargetMode") or "").lower() != "external":
+            continue
+        target = el.get("Target") or ""
+        if target:
+            out.append(target)
+    return out
+
+
+def _docx_mask_rel_targets(raw: bytes, extras: Any, masker: Masker) -> Tuple[bytes, int]:
+    """Маскирует внешние цели связей (гиперссылки, mailto:) в *.rels.
+
+    Адрес ссылки не виден в тексте документа, но лежит в XML рядом с ним:
+    `mailto:ivanov@example.ru` или URL с фамилией в пути. ElementTree здесь
+    не используется — его сериализация меняет префикс пространства имён
+    (`ns0:`), а менять нужно только значения атрибутов Target.
+    """
+    targets = _docx_rel_targets(raw)
+    if not targets:
+        return raw, 0
+    from xml.sax.saxutils import escape as xml_escape
+
+    def attr(value: str) -> str:
+        return xml_escape(value, {'"': "&quot;"})
+
+    text = raw.decode("utf-8", "ignore")
+    masked = 0
+    for target in targets:
+        new = mask_text(target, extras, masker)
+        if not new or new == target:
+            continue
+        needle = f'Target="{attr(target)}"'
+        if needle in text:
+            text = text.replace(needle, f'Target="{attr(new)}"', 1)
+            masked += 1
+    if not masked:
+        return raw, 0
+    return text.encode("utf-8"), masked
+
+
+def _docx_paragraph_items(paragraph) -> List[Any]:
+    """Элементы текста абзаца и разделители на месте w:br / w:cr / w:tab.
+
+    Разрыв строки внутри абзаца нельзя просто выбрасывать: «Общество с» и
+    «ограниченной ответственностью» склеивались в одно слово
+    «сограниченной», модель не видела название организации, и оно оставалось
+    в документе. Разделитель — обычная строка, элемент текста — элемент XML.
+    """
+    tag = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    out: List[Any] = []
+
+    def walk(el) -> None:
+        for child in el:
+            if child.tag in (tag + "p", tag + "pPr", tag + "rPr"):
+                # Вложенные абзацы (надписи) обходятся отдельно, а в
+                # свойствах абзаца w:tab — это позиция табуляции, а не символ.
+                continue
+            if child.tag in (tag + "t", tag + "delText", tag + "instrText"):
+                # w:delText — удалённый, но остающийся в файле текст (режим
+                # исправлений), w:instrText — коды полей (в т.ч. mailto:).
+                # И то и другое видно в XML, поэтому обезличивается наравне
+                # с обычным текстом.
+                out.append(child)
+            elif child.tag in (tag + "br", tag + "cr"):
+                out.append("\n")
+            elif child.tag == tag + "tab":
+                out.append(" ")
+            else:
+                walk(child)
+
+    walk(paragraph)
+    return out
+
+
+def _docx_items_text(items: List[Any]) -> str:
+    return "".join(item if isinstance(item, str) else (item.text or "")
+                   for item in items)
+
+
 def _docx_own_runs(paragraph) -> List[Any]:
-    """w:t этого абзаца, без вложенных абзацев (текстовые поля/надписи)."""
+    """Элементы текста этого абзаца, без вложенных абзацев (поля/надписи)."""
     tag = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
     out: List[Any] = []
 
@@ -2810,7 +3328,7 @@ def _docx_own_runs(paragraph) -> List[Any]:
         for child in el:
             if child.tag == tag + "p":
                 continue
-            if child.tag == tag + "t":
+            if child.tag in (tag + "t", tag + "delText", tag + "instrText"):
                 out.append(child)
             else:
                 walk(child)
@@ -2825,16 +3343,23 @@ def _docx_part_paragraphs(root) -> List[Any]:
 
 
 def _mask_docx_paragraph(paragraph, extras: Any, masker: Masker) -> bool:
-    runs = _docx_own_runs(paragraph)
+    items = _docx_paragraph_items(paragraph)
+    runs = [item for item in items if not isinstance(item, str)]
     texts = [r.text or "" for r in runs]
     chars: List[str] = []
-    cmap: List[Tuple[int, int]] = []
-    for ri, text in enumerate(texts):
-        for oi, ch in enumerate(text):
+    cmap: List[Any] = []
+    ri = 0
+    for item in items:
+        if isinstance(item, str):
+            chars.append(item)
+            cmap.append(None)
+            continue
+        for oi, ch in enumerate(texts[ri]):
             if ch in _ZERO_WIDTH:
                 continue
             chars.append(_norm_char(ch))
             cmap.append((ri, oi))
+        ri += 1
     joined = "".join(chars)
     if not joined.strip():
         return False
@@ -2922,7 +3447,7 @@ def extract_docx_segments(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
                         if len(el) == 0 and el.text and el.text.strip():
                             lines.append(el.text.strip())
                 for p in _docx_part_paragraphs(root):
-                    text = "".join(t.text or "" for t in _docx_own_runs(p))
+                    text = _docx_items_text(_docx_paragraph_items(p))
                     if text.strip():
                         lines.append(text)
                 part_text = "\n".join(lines)
@@ -2930,6 +3455,23 @@ def extract_docx_segments(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
                     continue
                 segments.append({"start": position, "end": position + len(part_text),
                                  "label": _docx_part_label(name)})
+                parts.append(part_text)
+                position += len(part_text) + 1
+            # Внешние адреса из word/_rels/*.rels не видны в тексте, но
+            # остаются в файле. Отдаём их модели отдельным фрагментом, чтобы
+            # она предложила для них замену.
+            links: List[str] = []
+            for name in z.namelist():
+                if not (name.startswith("word/_rels/") and name.endswith(".rels")):
+                    continue
+                for target in _docx_rel_targets(z.read(name)):
+                    low = target.lower()
+                    if low.startswith(("mailto:", "http://", "https://", "ftp://")):
+                        links.append(target)
+            if links:
+                part_text = "\n".join(dict.fromkeys(links))
+                segments.append({"start": position, "end": position + len(part_text),
+                                 "label": "адреса гиперссылок"})
                 parts.append(part_text)
                 position += len(part_text) + 1
     except Exception as e:
@@ -2970,10 +3512,19 @@ def mask_docx_file(input_path: Path, output_path: Path, extras: Any = (),
                                 masked += 1
                                 changed = True
                 if changed:
-                    changed_parts[name] = ET.tostring(root, encoding="UTF-8",
-                                                      xml_declaration=True)
+                    data = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+                    changed_parts[name] = _docx_keep_namespaces(raw, data)
                 if progress:
                     progress(index + 1, len(parts))
+            # Внешние цели связей: mailto:/URL в word/_rels/*.rels. В тексте
+            # документа их не видно, поэтому обычные проходы их не замечают.
+            for name in zin.namelist():
+                if not (name.startswith("word/_rels/") and name.endswith(".rels")):
+                    continue
+                data, rel_masked = _docx_mask_rel_targets(zin.read(name), extras, masker)
+                if rel_masked:
+                    changed_parts[name] = data
+                    masked += rel_masked
             with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
                     data = changed_parts.get(item.filename)
@@ -3059,7 +3610,8 @@ def process_doc(input_path: Path, output_path: Path,
             tmp.unlink(missing_ok=True)
         except Exception:
             pass
-    result["warning"] = "Файл .doc преобразован в .docx"
+    result["warning"] = ("Файл .doc преобразован в .docx"
+                         + (f". {result['warning']}" if result.get("warning") else ""))
     return result
 
 
@@ -3088,8 +3640,16 @@ def process_docx(input_path: Path, output_path: Path,
     stats = mask_docx_file(
         input_path, output_path, extras, masker=masker,
         progress=_progress_callback(progress, 73, 24, "Правка документа"))
+    left = _not_applied(masker, replacements)
+    unused = _unused_warning(left, len(replacements), filename or input_path.name)
+    if unused:
+        _append_mask_log(user, filename or input_path.name,
+                         [{**item, "status": "не найдено в файле"} for item in left],
+                         page="проверка файла")
     report(100, "Готово")
     result: Dict[str, Any] = {"preview_type": "docx", **stats, "llm_used": llm_ok}
+    if unused:
+        result["warning"] = unused
     return result
 
 
@@ -3320,8 +3880,16 @@ def process_image(input_path: Path, output_path: Path,
     stats = mask_image_file(
         input_path, output_path, lines, extras, masker=masker,
         progress=_progress_callback(progress, 73, 24, "Перерисовка изображения"))
+    left = _not_applied(masker, replacements)
+    unused = _unused_warning(left, len(replacements), filename or input_path.name)
+    if unused:
+        _append_mask_log(user, filename or input_path.name,
+                         [{**item, "status": "не найдено в файле"} for item in left],
+                         page="проверка файла")
     report(100, "Готово")
     result: Dict[str, Any] = {"preview_type": "image", **stats, "llm_used": llm_ok}
+    if unused:
+        result["warning"] = unused
     return result
 
 
@@ -3364,6 +3932,13 @@ def process_pdf(input_path: Path, output_path: Path,
     stats = mask_pdf_file(
         input_path, output_path, extras, masker=masker,
         progress=_progress_callback(progress, 73, 24, "Перерисовка документа"))
+    left = _not_applied(masker, replacements)
+    unused = _unused_warning(left, len(replacements), filename or input_path.name)
+    if unused:
+        warning = f"{warning} {unused}".strip() if warning else unused
+        _append_mask_log(user, filename or input_path.name,
+                         [{**item, "status": "не найдено в файле"} for item in left],
+                         page="проверка файла")
     report(98, "Сохранение")
     preview = ""
     try:
@@ -3407,7 +3982,17 @@ def process_excel(input_path: Path, output_path: Path,
     stats = mask_excel_file(
         input_path, output_path, extras, masker=masker,
         progress=_progress_callback(progress, 73, 24, "Перерисовка документа"))
+    left = _not_applied(masker, replacements)
+    unused = _unused_warning(left, len(replacements), filename or input_path.name)
+    if unused:
+        _append_mask_log(user, filename or input_path.name,
+                         [{**item, "status": "не найдено в файле"} for item in left],
+                         page="проверка файла")
     report(98, "Сохранение")
+    stats_warning = str(stats.pop("warning", "") or "")
     result: Dict[str, Any] = {"preview_type": "excel", "preview": stats.pop("preview_rows", []),
                               "llm_used": llm_ok, **stats}
+    warning = "; ".join(part for part in (stats_warning, unused) if part)
+    if warning:
+        result["warning"] = warning
     return result

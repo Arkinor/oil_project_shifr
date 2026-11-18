@@ -113,8 +113,11 @@ def process(file: UploadFile = File(...), user: str = Depends(get_current_user))
     if not check_llm(s):
         # Модель может быть не загружена — LM Studio загрузит её по первому
         # запросу. Отказ только если сервер недоступен или модели нет в списке.
-        raise HTTPException(503, f"LM Studio недоступна или модель {s.get('model')} "
-                                 "не найдена — загрузка не начата")
+        models = processing.available_models(s)
+        hint = (f" Доступные модели: {', '.join(models[:10])}" if models else "")
+        raise HTTPException(503, f"LM Studio недоступна по {s.get('lm_studio_url')} "
+                                 f"или модель {s.get('model')} "
+                                 f"не найдена — загрузка не начата.{hint}")
     original = _safe_name(file.filename or "document")
     ext = Path(original).suffix.lower()
     if ext not in (".pdf", ".xlsx", ".docx", ".doc", *IMAGE_EXTS):

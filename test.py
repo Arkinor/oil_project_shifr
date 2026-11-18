@@ -178,7 +178,10 @@ def main() -> int:
     print("Загрузка модели...")
     if not processing.warm_up_llm(settings, report=lambda _, stage: print(
             f"  {stage}", flush=True)):
-        print("Модель в LM Studio не загрузилась — проверьте настройки и сервер")
+        detail = processing._warm_error(settings)
+        print("Модель в LM Studio не загрузилась"
+              + (f": {detail[:300]}" if detail else "")
+              + " — проверьте настройки и сервер")
         return 1
 
     phrases = _collect_phrases()
