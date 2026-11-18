@@ -9,8 +9,13 @@
   "llm_retries": 3,
   "llm_chunk_chars": 3500,
   "llm_enabled": true,
+  "reasoning_effort": "none",
+  "strip_images": false,
   "ocr_lang": "rus+eng",
   "host": "0.0.0.0",
   "port": 9321,
-  "open_browser": true
+  "open_browser": true,
+  "max_upload_mb": 50,
+  "tray_enabled": true,
+  "tray_minimize_on_close": true
 }

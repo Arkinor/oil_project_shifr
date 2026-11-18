@@ -740,6 +740,8 @@ _JSON_RESPONSE_FORMAT: Dict[str, Any] = {
 # «сервер + модель»: при смене модели в settings.json не нужно перезапускать
 # процесс, а отказ одной модели не выключает JSON-режим для другой.
 _JSON_MODE_OFF: set[Tuple[str, str]] = set()
+# Модели, которые отвергли reasoning_effort: им параметр больше не отправляем.
+_REASONING_OFF: set[Tuple[str, str]] = set()
 _JSON_MODE_LOCK = threading.Lock()
 _WARMED_MODELS: set[Tuple[str, str]] = set()
 _WARM_ERRORS: Dict[Tuple[str, str], str] = {}
@@ -763,6 +765,21 @@ def _disable_json_mode(key: Tuple[str, str]) -> None:
     if first:
         logger.info(f"LLM: {key[1] or 'модель'} не поддерживает JSON-режим — "
                     "дальше обычный ответ без response_format")
+
+
+def _reasoning_effort_enabled(settings: Dict[str, Any]) -> bool:
+    with _JSON_MODE_LOCK:
+        return _llm_key(settings) not in _REASONING_OFF
+
+
+def _disable_reasoning_effort(key: Tuple[str, str]) -> bool:
+    with _JSON_MODE_LOCK:
+        if key in _REASONING_OFF:
+            return False
+        _REASONING_OFF.add(key)
+    logger.info(f"LLM: {key[1] or 'модель'} не принимает reasoning_effort — "
+                "дальше запросы без этого параметра")
+    return True
 
 
 def _model_is_warm(settings: Dict[str, Any]) -> bool:
@@ -797,6 +814,11 @@ def get_llm(settings: Dict[str, Any] | None = None, json_mode: bool = False):
     kwargs: Dict[str, Any] = {}
     if json_mode and _json_mode_enabled(s):
         kwargs["model_kwargs"] = {"response_format": _JSON_RESPONSE_FORMAT}
+    effort = str(s.get("reasoning_effort") or "").strip()
+    if effort and _reasoning_effort_enabled(s):
+        # Thinking-модели тратят на «размышления» весь лимит ответа: запрос
+        # длится минуты и упирается в таймаут, а JSON не помещается.
+        kwargs["reasoning_effort"] = effort
     try:
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(
@@ -807,6 +829,29 @@ def get_llm(settings: Dict[str, Any] | None = None, json_mode: bool = False):
     except Exception as e:
         logger.error(f"LLM init: {e}")
         return None
+
+
+def _chunk_timeout(settings: Dict[str, Any], chars: int) -> float:
+    """Сколько ждать ответ на фрагмент указанной длины.
+
+    Локальная модель пишет ответ токен за токеном, поэтому фиксированные
+    120 с обрывают длинный фрагмент на середине: запрос уходит в таймаут и
+    документ не выдаётся. Запас растёт с объёмом текста, но ограничен
+    сверху, чтобы зависший сервер не держал задание бесконечно.
+    """
+    base = float(settings.get("request_timeout", 120) or 120)
+    by_size = 120.0 + max(0, int(chars)) * 0.1
+    return max(base, min(900.0, by_size))
+
+
+def _llm_for_chunk(llm, settings: Dict[str, Any], chars: int):
+    """Тот же клиент, но с таймаутом под размер фрагмента."""
+    timeout = _chunk_timeout(settings, chars)
+    current = float(getattr(llm, "request_timeout", 0) or 0)
+    if current >= timeout:
+        return llm
+    return get_llm({**settings, "request_timeout": timeout},
+                   json_mode=_invoke_uses_json_mode(llm)) or llm
 
 
 def _lm_base_url(settings: Dict[str, Any]) -> str:
@@ -965,6 +1010,19 @@ def _is_length_limit_error(message: str) -> bool:
         "length limit", "finish reason: length", "finish_reason: length",
         "finish_reason=length", "maximum context length of the output",
         "max_tokens", "max tokens"))
+
+
+def _is_timeout_error(message: str) -> bool:
+    """Запрос не уложился в таймаут: модель думала слишком долго.
+
+    Повторять тот же запрос с тем же таймаутом бессмысленно — он снова
+    упрётся в те же 120 секунд. Фрагмент дробится, а маленький повторяется
+    с удвоенным таймаутом.
+    """
+    text = str(message or "").lower()
+    return any(key in text for key in (
+        "timed out", "timeout", "read timeout", "deadline exceeded",
+        "request timed out"))
 
 
 def _is_model_loading_error(message: str) -> bool:
@@ -1366,7 +1424,9 @@ def _llm_error_text(exc: BaseException) -> str:
 
 
 def _invoke(llm, messages: List[Any], retries: int,
-            json_key: Tuple[str, str] | None = None) -> Tuple[str | None, str, bool]:
+            json_key: Tuple[str, str] | None = None,
+            settings: Dict[str, Any] | None = None
+            ) -> Tuple[str | None, str, bool]:
     """Запрос к модели. Третий элемент — «нужно повторить без json-режима»."""
     last = ""
     key = json_key or ("", "")
@@ -1388,6 +1448,17 @@ def _invoke(llm, messages: List[Any], retries: int,
             status = _http_status_code(e)
             logger.warning(f"LLM запрос: {last[:300]}")
             if _is_length_limit_error(last):
+                return None, last, False
+            if "reasoning_effort" in last.lower() and _disable_reasoning_effort(key):
+                # Сервер не знает этот параметр — повторяем тот же запрос без него.
+                # Настройки вызывающего кода важны: в них может быть увеличенный
+                # таймаут и уменьшенный max_tokens для пробного запроса.
+                llm = get_llm(settings or load_settings(),
+                              json_mode=_invoke_uses_json_mode(llm)) or llm
+                continue
+            if _is_timeout_error(last):
+                # Не ждём те же 120 секунд ещё четыре раза: решение принимает
+                # вызывающий код — дробить фрагмент или дать больше времени.
                 return None, last, False
             # Сервер отклонил сам формат ответа — это не сбой модели и не повод
             # повторять тот же запрос: переключаемся на обычный текстовый ответ.
@@ -1454,11 +1525,11 @@ def _repair_replacements(llm, settings: Dict[str, Any], chunk: str,
     )
     key = _llm_key(settings)
     raw, _, plain = _invoke(llm, [("system", ANON_SYSTEM), ("human", prompt)],
-                            retries, key)
+                            retries, key, settings)
     if plain:
         llm = get_llm(settings, json_mode=False) or llm
         raw, _, _ = _invoke(llm, [("system", ANON_SYSTEM), ("human", prompt)],
-                            retries, key)
+                            retries, key, settings)
     if not raw:
         return []
     parsed = _parse_replacements(raw, chunk)
@@ -1475,36 +1546,59 @@ def _request_replacements(llm, settings: Dict[str, Any], chunk: Dict[str, Any],
     """Замены для одного фрагмента. None — фрагмент обработать не удалось."""
     text = chunk["text"]
     label = chunk["label"]
+    llm = _llm_for_chunk(llm, settings, len(text))
     prompt = (f"{_known_hint(known, text)}{label}. Ниже текст фрагмента. "
               f"Верни JSON с заменами:\n\n{text}")
     messages = [("system", ANON_SYSTEM), ("human", prompt)]
     key = _llm_key(settings)
-    raw, error, plain = _invoke(llm, messages, retries, key)
+    raw, error, plain = _invoke(llm, messages, retries, key, settings)
     if plain:
         llm = get_llm(settings, json_mode=False) or llm
-        raw, error, _ = _invoke(llm, messages, retries, key)
+        raw, error, _ = _invoke(llm, messages, retries, key, settings)
     had_response = raw is not None
     parsed = _parse_replacements(raw, text) if raw else None
     if parsed is None and raw is not None:
         raw, error, _ = _invoke(
             llm, [("system", ANON_SYSTEM),
                   ("human", prompt + "\n\nОтвет — только JSON-объект, без пояснений.")],
-            0, key)
+            0, key, settings)
         parsed = _parse_replacements(raw, text) if raw else None
     if parsed is None:
         reason = str(error or "").lower()
         context_error = "context" in reason
         truncated = _is_length_limit_error(reason)
-        if depth < 3 and len(text) > 400 and (
-                had_response or context_error or truncated):
+        timeout_error = _is_timeout_error(reason)
+        if (timeout_error and len(text) <= 400
+                and not chunk.get("long_wait")):
+            # Маленький фрагмент дробить уже некуда — даём модели вдвое
+            # больше времени и только потом сдаёмся.
+            longer = max(60.0, _chunk_timeout(settings, len(text)) * 2)
+            slow_llm = get_llm({**settings, "request_timeout": longer},
+                               json_mode=_invoke_uses_json_mode(llm))
+            if slow_llm is not None:
+                retry_chunk = dict(chunk)
+                retry_chunk["long_wait"] = True
+                logger.warning(f"LLM {label}: таймаут, повтор с таймаутом "
+                               f"{longer:.0f} с")
+                return _request_replacements(slow_llm, settings, retry_chunk,
+                                             known, retries, depth)
+        # Таймаут лечится дроблением, но не бесконечно: каждая попытка может
+        # стоить несколько минут, поэтому для таймаутов допускаем меньше уровней.
+        max_depth = 2 if timeout_error else 3
+        if depth < max_depth and len(text) > 400 and (
+                had_response or context_error or truncated or timeout_error):
             halves = _split_long(text, 0, len(text), chunk.get("place") or label,
                                  max(600, len(text) // 2), CHUNK_OVERLAP)
             combined: List[Dict[str, str]] = []
             seen: set[str] = set()
+            # Словарь только для подсказок соседним частям. В общий known
+            # пары запишет вызывающий код, иначе все найденные значения
+            # вернутся обратно и будут отброшены как дубли.
+            hints = dict(known)
             for part_index, half in enumerate(halves):
                 part = {"text": text[half["start"]:half["end"]],
                         "label": f"{label}.{part_index + 1}", "place": chunk.get("place")}
-                got, error = _request_replacements(llm, settings, part, known, retries, depth + 1)
+                got, error = _request_replacements(llm, settings, part, hints, retries, depth + 1)
                 if got is None:
                     return None, error
                 for item in got:
@@ -1513,7 +1607,7 @@ def _request_replacements(llm, settings: Dict[str, Any], chunk: Dict[str, Any],
                     if key not in seen:
                         seen.add(key)
                         combined.append(item)
-                    known.setdefault(key, (item["original"], item["replacement"]))
+                    hints.setdefault(key, (item["original"], item["replacement"]))
             return combined, ""
         logger.warning(f"LLM {label}: ответ без корректных замен")
         return None, error or "invalid_json"
@@ -1621,12 +1715,6 @@ def anonymize_text(text: str,
                     f"новых замен {added} | пропущено дублей {len(got) - added}")
     if progress:
         progress(total, total)
-    if not replacements:
-        # Пустой ответ модели — не успех: файл ушёл бы наружу без единой
-        # замены, а пользователь увидел бы «Готово». Отказ безопаснее.
-        logger.error(f"LLM | {filename or 'документ'}: модель не нашла ни одной "
-                     f"замены ({len(text)} символов, {total} фрагментов)")
-        return [], False, "no_replacements"
 
     # Страховка по форматам: модель могла пропустить реквизиты в плотном
     # фрагменте. Добавляем только те значения, для которых пары ещё нет.
@@ -1641,6 +1729,14 @@ def anonymize_text(text: str,
         _append_mask_log(user, filename, structured, page="проверка по форматам")
         logger.info(f"REGEX | {filename or 'документ'}: добавлено {len(structured)} "
                     f"замен, которых не было в ответе модели")
+
+    if not replacements:
+        # Ни модель, ни проверка по форматам не нашли ни одного значения.
+        # Пустой результат — не успех: файл ушёл бы наружу без единой
+        # замены, а пользователь увидел бы «Готово». Отказ безопаснее.
+        logger.error(f"LLM | {filename or 'документ'}: модель не нашла ни одной "
+                     f"замены ({len(text)} символов, {total} фрагментов)")
+        return [], False, "no_replacements"
 
     logger.info(f"LLM | готово: {len(replacements)} замен, обработано {processed} символов")
     return replacements, True, ""
@@ -1662,6 +1758,10 @@ def _llm_failure_message(error: str) -> str:
     if _is_length_limit_error(error):
         return ("Модель не смогла уложить ответ в лимит вывода — обработка "
                 "отменена, файл не выдан. Повторите обработку")
+    if _is_timeout_error(error):
+        return ("Модель не ответила за отведённое время — обработка отменена, "
+                "файл не выдан. Проверьте, что LM Studio не занята другой "
+                "задачей, и повторите обработку")
     lowered = str(error or "").lower()
     if any(key in lowered for key in ("error code: 4", "response_format",
                                       "json_object", "json_schema")):
@@ -2641,8 +2741,9 @@ def _images_note(count: Any) -> str:
         return ""
     if count <= 0:
         return ""
-    return (f"Из документа удалены изображения и штампы ({count}): печати, "
-            "подписи и логотипы больше не видны")
+    return (f"Удалены изображения и штампы ({count}) — включена настройка "
+            "«удалять изображения». Печати, подписи и логотипы в файле "
+            "не сохранены")
 
 
 def _replacement_order(replacements: Any) -> List[Dict[str, str]]:
@@ -3581,6 +3682,7 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = (),
     images_removed = 0
     pages = len(doc)
     masker = masker or Masker()
+    strip_images = bool(load_settings().get("strip_images", False))
     for page_index, page in enumerate(doc):
         page_dict = page.get_text("dict")
         blocks = page_dict.get("blocks", [])
@@ -3673,7 +3775,8 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = (),
                          draw_text, _span_color(span), path, rot))
         if not jobs:
             total += _scrub_pdf_annotations(page, extras, masker)
-            images_removed += _strip_pdf_images(page)
+            if strip_images:
+                images_removed += _strip_pdf_images(page)
             if progress:
                 progress(page_index + 1, pages)
             continue
@@ -3699,7 +3802,8 @@ def mask_pdf_file(input_path: Path, output_path: Path, extras: Any = (),
                 page.insert_text(origin, MASK, fontname="helv", fontsize=fs,
                                  color=color, rotate=rot)
         total += _scrub_pdf_annotations(page, extras, masker)
-        images_removed += _strip_pdf_images(page)
+        if strip_images:
+            images_removed += _strip_pdf_images(page)
         if progress:
             progress(page_index + 1, pages)
     total += _scrub_pdf_metadata(doc, extras, masker)
@@ -4100,7 +4204,8 @@ def mask_excel_file(input_path: Path, output_path: Path, extras: Any = (),
         masked += _scrub_excel_properties(wb, masker, extras)
         wb.save(output_path)
         preview = _excel_preview(wb.active)
-        images_removed = _blank_office_images(output_path)
+        images_removed = (_blank_office_images(output_path)
+                          if load_settings().get("strip_images", False) else 0)
     finally:
         wb.close()
         if cached_wb is not None:
@@ -4517,6 +4622,7 @@ def mask_docx_file(input_path: Path, output_path: Path, extras: Any = (),
     parts = _docx_parts(input_path)
     masked = 0
     media_removed = 0
+    strip_images = bool(load_settings().get("strip_images", False))
     changed_parts: Dict[str, bytes] = {}
     try:
         with zipfile.ZipFile(input_path) as zin:
@@ -4558,7 +4664,7 @@ def mask_docx_file(input_path: Path, output_path: Path, extras: Any = (),
             with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
                     name = item.filename
-                    if _is_media_entry(name):
+                    if _is_media_entry(name) and strip_images:
                         # Печати, подписи и логотипы: текст с них не читается,
                         # поэтому картинка заменяется пустым изображением.
                         zout.writestr(item, blank)
